@@ -1,0 +1,14 @@
+# Output files
+output/
+*.mp4
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Assets (large files)
+envs/assets/
+
+# Claude Code
+.claude/
