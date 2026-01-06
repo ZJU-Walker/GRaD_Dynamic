@@ -41,12 +41,19 @@ python controller/waypoint_nav_geometric.py --map gate_mid --v_avg 0.5 --save_3d
 Collect flight data using the geometric controller:
 
 ```bash
-# Collect 30 sequences at 30 Hz
+# Collect 30 sequences with velocity variation [0.5, 2.0] m/s
 python training/vel_net/train_vel_net.py collect \
     --map gate_mid \
     --n_sequences 30 \
     --freq 30 \
+    --v_min 0.5 --v_max 2.0 \
     --output_dir data/vel_net/sequences
+
+# Collect with fixed velocity (v_min == v_max)
+python training/vel_net/train_vel_net.py collect \
+    --map gate_mid \
+    --n_sequences 10 \
+    --v_min 1.0 --v_max 1.0
 ```
 
 **Options:**
@@ -55,14 +62,19 @@ python training/vel_net/train_vel_net.py collect \
 | `--map` | Map name | `gate_mid` |
 | `--n_sequences` | Number of sequences | `30` |
 | `--freq` | Collection frequency (Hz) | `30` |
-| `--v_avg` | Average velocity (m/s), same as nav | `0.5` |
+| `--v_min` | Min velocity (m/s) | `0.5` |
+| `--v_max` | Max velocity (m/s). If != v_min, random per sequence | `2.0` |
 | `--smoothing` | B-spline corner smoothing factor | `0.018` |
-| `--vary_velocity` | Enable random velocity per sequence | off |
-| `--v_min` | Min velocity (with --vary_velocity) | `0.5` |
-| `--v_max` | Max velocity (with --vary_velocity) | `2.0` |
 | `--output_dir` | Output directory | `data/vel_net/sequences` |
 
-**Note:** Default parameters: `v_avg=0.5`, `smoothing=0.018`. Use `--vary_velocity` for training data diversity.
+**Note:** If `v_min == v_max`, fixed velocity is used. Otherwise, random velocity is sampled from [v_min, v_max] for each sequence.
+
+**Collection Progress Output:**
+```
+[ 1/10] v=1.23m/s: 100%|████████████████████| OK | 1467 frames | 29.3s
+[ 2/10] v=0.87m/s: 100%|████████████████████| COLLISION | 453 frames | 9.1s
+[ 3/10] v=1.95m/s: 100%|████████████████████| TIMEOUT | 1200 frames | 24.0s
+```
 
 **Output structure:**
 ```
