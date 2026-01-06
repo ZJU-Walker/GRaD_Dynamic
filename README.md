@@ -85,17 +85,58 @@ Running with `--save_3d_plot --save_traj_data` generates:
 - `*_3d_trajectory.png` - 3D trajectory plot with multiple views
 - `*_trajectory_data.npz` - Trajectory data (actual, desired, errors, times)
 
+## Velocity Network (vel_net)
+
+Auto-regressive GRU network for drone velocity estimation with PINN loss.
+
+### Architecture
+```
+Input (49 dims) → LayerNorm → Projector MLP → GRU (3 layers) → Head MLP → Velocity (3D)
+```
+
+### Observation Structure (49 dims)
+| Component | Dims | Description |
+|-----------|------|-------------|
+| Rot6D | 6 | Rotation (first 2 cols of rotation matrix) |
+| Action | 4 | Current thrust/body rates |
+| Prev Action | 4 | Previous thrust/body rates |
+| Prev Velocity | 3 | Auto-regressive term |
+| RGB Features | 16 | Visual encoder output |
+| Depth Features | 16 | Depth encoder output |
+
+### Usage
+```python
+from models import VELO_NET, VelObsHistBuffer, build_vel_observation
+
+# Create model
+model = VELO_NET(num_obs=49, stack_size=5, device='cuda:0')
+
+# Training
+loss = model.loss_fn(obs_history, vel_gt, thrust=thrust_history)
+
+# Inference (auto-regressive)
+predictions = model.inference(get_sensor_obs_fn, num_steps=100, batch_size=1)
+```
+
+---
+
 ## Project Structure
 
 ```
+models/
+  └── vel_net/                     # Velocity estimation network
+      ├── vel_net.py               # VELO_NET model
+      ├── vel_obs_buffer.py        # History buffer
+      └── vel_obs_utils.py         # Rot6D, observation builders
+
 controller/
-  ├── waypoint_nav_geometric.py  # Main script
-  ├── nav_helpers.py             # Helper functions (path planning, visualization)
-  └── geometric_controller.py    # SE(3) geometric controller
+  ├── waypoint_nav_geometric.py    # Main navigation script
+  ├── nav_helpers.py               # Helper functions
+  └── geometric_controller.py      # SE(3) controller
 
 trajectory/
-  └── bspline_trajectory.py      # B-spline trajectory generation
+  └── bspline_trajectory.py        # B-spline trajectory generation
 
 utils/
-  └── traj_planner_global.py     # A* path planner
+  └── traj_planner_global.py       # A* path planner
 ```
