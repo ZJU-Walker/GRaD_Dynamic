@@ -12,3 +12,8 @@ envs/assets/
 
 # Claude Code
 .claude/
+
+data/
+*.png
+*.jpg
+*.npz
