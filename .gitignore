@@ -17,3 +17,6 @@ data/
 *.png
 *.jpg
 *.npz
+
+# checkpoints
+checkpoints/
