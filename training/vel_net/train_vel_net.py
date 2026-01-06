@@ -43,16 +43,13 @@ def collect_command(args):
     """Run data collection."""
     from training.vel_net.data_collector import collect_sequences
 
-    # Only enable velocity variation if --vary_velocity flag is set
-    v_avg_range = (args.v_min, args.v_max) if args.vary_velocity else None
-
     collect_sequences(
         output_dir=args.output_dir,
         map_name=args.map,
         n_sequences=args.n_sequences,
         collection_freq=args.freq,
-        v_avg=args.v_avg,
-        v_avg_range=v_avg_range,
+        v_min=args.v_min,
+        v_max=args.v_max,
         smoothing=args.smoothing,
         device=args.device,
     )
@@ -199,14 +196,10 @@ def main():
                                 help='Number of sequences to collect')
     collect_parser.add_argument('--freq', type=float, default=30.0,
                                 help='Collection frequency (Hz)')
-    collect_parser.add_argument('--v_avg', type=float, default=0.5,
-                                help='Average velocity (m/s), same as waypoint_nav_geometric.py')
-    collect_parser.add_argument('--vary_velocity', action='store_true',
-                                help='Enable velocity variation (random v_avg per sequence)')
     collect_parser.add_argument('--v_min', type=float, default=0.5,
-                                help='Min velocity for variation (only used with --vary_velocity)')
+                                help='Min velocity (m/s). If v_min == v_max, fixed velocity is used.')
     collect_parser.add_argument('--v_max', type=float, default=2.0,
-                                help='Max velocity for variation (only used with --vary_velocity)')
+                                help='Max velocity (m/s). If v_min != v_max, random velocity per sequence.')
     collect_parser.add_argument('--smoothing', type=float, default=0.018,
                                 help='B-spline corner smoothing factor')
     collect_parser.add_argument('--device', type=str, default='cuda:0',
