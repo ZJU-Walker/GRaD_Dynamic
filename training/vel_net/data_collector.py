@@ -32,6 +32,7 @@ import torch
 from PIL import Image
 from typing import Optional, List, Dict, Tuple
 import time
+from tqdm import tqdm
 
 from envs.drone_env import SimpleDroneEnv
 from controller.geometric_controller import GeometricController
@@ -43,7 +44,6 @@ from controller.nav_helpers import (
     save_trajectory_profile,
 )
 from trajectory.bspline_trajectory import BSplineTrajectorySampler
-from utils.common import print_info, print_ok
 
 
 # Coordinate offset: point cloud space -> simulation space
@@ -155,7 +155,6 @@ class DataCollector:
             orientations=np.array(self.orientations),
             actions=np.array(self.actions),
         )
-        print(f"    Telemetry: {len(self.timestamps)} frames")
 
         # Save RGB images
         rgb_dir = seq_dir / "rgb"
@@ -166,14 +165,12 @@ class DataCollector:
             else:
                 rgb = rgb.astype(np.uint8)
             Image.fromarray(rgb).save(rgb_dir / f"{i:06d}.png")
-        print(f"    RGB: {len(self.rgb_images)} images")
 
         # Save depth images
         depth_dir = seq_dir / "depth"
         depth_dir.mkdir(exist_ok=True)
         for i, depth in enumerate(self.depth_images):
             np.save(depth_dir / f"{i:06d}.npy", depth)
-        print(f"    Depth: {len(self.depth_images)} images")
 
         # Save trajectory plot
         if len(self.trajectory_actual) > 0 and len(self.trajectory_desired) > 0:
@@ -184,8 +181,8 @@ class DataCollector:
                     waypoints=waypoints_sim,
                     output_path=str(seq_dir / "trajectory.png"),
                 )
-            except Exception as e:
-                print(f"    Warning: Could not save trajectory plot: {e}")
+            except Exception:
+                pass
 
         self.reset_buffers()
         return str(seq_dir)
@@ -197,6 +194,7 @@ class DataCollector:
         seq_idx: int,
         waypoints_sim: List[np.ndarray],
         max_steps: int = 3000,
+        pbar: tqdm = None,
     ) -> Tuple[str, dict]:
         """
         Fly trajectory and collect data (follows fly_trajectory from nav_helpers.py).
@@ -211,17 +209,21 @@ class DataCollector:
         # Get start position for stabilization
         start_pos_d, _, _, _ = sampler.sample(0.0)
 
-        print(f"\n  [Seq {seq_idx}] Flying trajectory...")
-        print(f"    Duration: {total_time:.2f}s")
-
-        step_count = 0
         collection_count = 0
+        fail_reason = None  # None = success, 'collision' or 'timeout'
+        t = 0.0
 
         for step in range(max_steps):
             t = max(0, (step - stabilize_steps) * dt)
 
             if t > total_time:
                 break
+
+            # Update progress bar
+            if pbar is not None:
+                progress = min(t / total_time, 1.0)
+                pbar.n = int(progress * 100)
+                pbar.refresh()
 
             # Get current state (in SIMULATION space)
             state = self.env.get_state()
@@ -264,11 +266,18 @@ class DataCollector:
                 self.collect_step(state, action, rgb, depth, t, pos_d)
                 collection_count += 1
 
-            step_count += 1
-
-            if done or info.get('collision', False):
-                print(f"    Episode ended at step {step}")
+            # Check for failure
+            if info.get('collision', False):
+                fail_reason = 'collision'
                 break
+            elif done:
+                fail_reason = 'timeout'
+                break
+
+        # Complete progress bar
+        if pbar is not None:
+            pbar.n = 100
+            pbar.refresh()
 
         # Save sequence
         seq_path = self.save_sequence(seq_idx, waypoints_sim)
@@ -277,10 +286,8 @@ class DataCollector:
             'seq_idx': seq_idx,
             'frames': collection_count,
             'duration': t,
-            'collision': info.get('collision', False),
+            'fail_reason': fail_reason,  # None = success, 'collision' or 'timeout'
         }
-
-        print(f"    Collected {collection_count} frames")
 
         return seq_path, stats
 
@@ -361,8 +368,8 @@ def save_planning_plots(
             output_path=str(seq_dir / "astar_bspline.png"),
             pc_offset=PC_TO_SIM_OFFSET,  # Convert sampler (sim space) back to PC space for comparison
         )
-    except Exception as e:
-        print(f"    Warning: Could not save A* vs B-spline plot: {e}")
+    except Exception:
+        pass
 
     # Save trajectory profile (position, velocity, acceleration vs time)
     try:
@@ -370,8 +377,8 @@ def save_planning_plots(
             sampler=sampler,
             output_path=str(seq_dir / "trajectory_profile.png"),
         )
-    except Exception as e:
-        print(f"    Warning: Could not save trajectory profile: {e}")
+    except Exception:
+        pass
 
 
 def collect_sequences(
@@ -379,19 +386,32 @@ def collect_sequences(
     map_name: str = "gate_mid",
     n_sequences: int = 30,
     collection_freq: float = 30.0,
-    v_avg: float = 0.5,
-    v_avg_range: Tuple[float, float] = None,  # None = use fixed v_avg (same as nav)
+    v_min: float = 0.5,
+    v_max: float = 2.0,
     smoothing: float = 0.018,  # B-spline corner smoothing
     device: str = "cuda:0",
 ) -> List[dict]:
-    """Collect multiple sequences for training."""
+    """Collect multiple sequences for training.
 
+    Args:
+        v_min: Minimum velocity (m/s)
+        v_max: Maximum velocity (m/s). If v_min == v_max, fixed velocity is used.
+               Otherwise, random velocity is sampled uniformly from [v_min, v_max].
+    """
+    # Determine velocity mode
+    vary_velocity = (v_min != v_max)
+
+    # Header
     print(f"\n{'='*60}")
     print(f"Velocity Network Data Collection")
     print(f"{'='*60}")
     print(f"  Map: {map_name}")
     print(f"  Sequences: {n_sequences}")
     print(f"  Collection freq: {collection_freq} Hz")
+    if vary_velocity:
+        print(f"  Velocity: random in [{v_min:.2f}, {v_max:.2f}] m/s")
+    else:
+        print(f"  Velocity: fixed at {v_min:.2f} m/s")
     print(f"  Output: {output_dir}")
     print(f"{'='*60}\n")
 
@@ -429,13 +449,11 @@ def collect_sequences(
     start_time = time.time()
 
     for seq_idx in range(n_sequences):
-        # Vary velocity for diversity
-        if v_avg_range is not None:
-            current_v_avg = np.random.uniform(v_avg_range[0], v_avg_range[1])
+        # Sample velocity for this sequence
+        if vary_velocity:
+            current_v_avg = np.random.uniform(v_min, v_max)
         else:
-            current_v_avg = v_avg
-
-        print(f"\n[Sequence {seq_idx}/{n_sequences}] v_avg={current_v_avg:.2f} m/s")
+            current_v_avg = v_min
 
         # Plan and generate trajectory
         sampler, start_pos_sim, waypoints_sim, path_pc, waypoints_pc = plan_and_generate_trajectory(
@@ -447,7 +465,6 @@ def collect_sequences(
         # Create sequence directory and save planning plots BEFORE flying
         seq_dir = Path(output_dir) / f"seq_{seq_idx:04d}"
         seq_dir.mkdir(parents=True, exist_ok=True)
-        print(f"  Saving planning plots to {seq_dir}...")
         save_planning_plots(
             seq_dir=seq_dir,
             sampler=sampler,
@@ -455,13 +472,26 @@ def collect_sequences(
             waypoints_pc=waypoints_pc,
         )
 
+        # Create progress bar for this sequence
+        desc = f"[{seq_idx+1:2d}/{n_sequences}] v={current_v_avg:.2f}m/s"
+        pbar = tqdm(total=100, desc=desc, bar_format='{l_bar}{bar:20}{r_bar}', leave=True)
+
         # Fly and collect
         seq_path, stats = collector.fly_and_collect(
             sampler=sampler,
             start_pos_sim=start_pos_sim,
             seq_idx=seq_idx,
             waypoints_sim=waypoints_sim,
+            pbar=pbar,
         )
+
+        # Update progress bar with result
+        if stats['fail_reason'] is None:
+            status = "OK"
+        else:
+            status = stats['fail_reason'].upper()  # COLLISION or TIMEOUT
+        pbar.set_postfix_str(f"{status} | {stats['frames']} frames | {stats['duration']:.1f}s")
+        pbar.close()
 
         stats['v_avg'] = current_v_avg
         stats['path'] = seq_path
@@ -470,11 +500,14 @@ def collect_sequences(
     # Summary
     total_time = time.time() - start_time
     total_frames = sum(s['frames'] for s in all_stats)
+    n_collisions = sum(1 for s in all_stats if s['fail_reason'] == 'collision')
+    n_timeouts = sum(1 for s in all_stats if s['fail_reason'] == 'timeout')
+    n_success = len(all_stats) - n_collisions - n_timeouts
 
     print(f"\n{'='*60}")
     print(f"Collection Complete!")
     print(f"{'='*60}")
-    print(f"  Total sequences: {len(all_stats)}")
+    print(f"  Sequences: {len(all_stats)} ({n_success} OK, {n_collisions} collision, {n_timeouts} timeout)")
     print(f"  Total frames: {total_frames}")
     print(f"  Total time: {total_time:.1f}s")
     print(f"  Avg frames/seq: {total_frames / len(all_stats):.0f}")
@@ -493,7 +526,10 @@ if __name__ == '__main__':
                         choices=['gate_mid', 'gate_left', 'gate_right'])
     parser.add_argument('--n_sequences', type=int, default=30)
     parser.add_argument('--freq', type=float, default=30.0)
-    parser.add_argument('--v_avg', type=float, default=0.5)
+    parser.add_argument('--v_min', type=float, default=0.5,
+                        help='Min velocity (m/s)')
+    parser.add_argument('--v_max', type=float, default=2.0,
+                        help='Max velocity (m/s). If v_min != v_max, random velocity per sequence.')
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--smoothing', type=float, default=0.018)
 
@@ -504,7 +540,8 @@ if __name__ == '__main__':
         map_name=args.map,
         n_sequences=args.n_sequences,
         collection_freq=args.freq,
-        v_avg=args.v_avg,
+        v_min=args.v_min,
+        v_max=args.v_max,
         smoothing=args.smoothing,
         device=args.device,
     )
