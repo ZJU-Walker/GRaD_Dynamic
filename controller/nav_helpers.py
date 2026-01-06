@@ -209,21 +209,6 @@ def save_trajectory_profile(
     print_ok(f"Trajectory profile saved: {output_path}")
     plt.close()
 
-    # Print summary statistics
-    print_info("Trajectory Statistics:")
-    print(f"  Duration: {sampler.total_time:.2f}s")
-    print(f"  Position range:")
-    print(f"    X: [{positions[:, 0].min():.2f}, {positions[:, 0].max():.2f}] m")
-    print(f"    Y: [{positions[:, 1].min():.2f}, {positions[:, 1].max():.2f}] m")
-    print(f"    Z: [{positions[:, 2].min():.2f}, {positions[:, 2].max():.2f}] m")
-    print(f"  Max velocity: [{np.max(np.abs(velocities[:, 0])):.2f}, {np.max(np.abs(velocities[:, 1])):.2f}, {np.max(np.abs(velocities[:, 2])):.2f}] m/s")
-    print(f"  Max acceleration: [{np.max(np.abs(accelerations[:, 0])):.2f}, {np.max(np.abs(accelerations[:, 1])):.2f}, {np.max(np.abs(accelerations[:, 2])):.2f}] m/s^2")
-
-    # Warn if accelerations are too high
-    max_acc_y = np.max(np.abs(accelerations[:, 1]))
-    if max_acc_y > 2.0:
-        print_warning(f"  Y acceleration ({max_acc_y:.2f} m/s^2) is high - may cause oscillation!")
-
     return {
         'time': times,
         'position': positions,
