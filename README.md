@@ -3,6 +3,7 @@
 ```
 python drone_pd_controller/waypoint_nav.py --map gate_mid --output output/nav_video_1.mp4 --visualize_path
 
+```
 ## To save traj only:
 ```
 python controller/waypoint_nav_geometric.py --map gate_mid --traj_only
