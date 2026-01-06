@@ -434,7 +434,8 @@ def fly_trajectory(
             yaw_d = 0.0
         elif t <= sampler.total_time:
             pos_d, vel_d, acc_d, _ = sampler.sample(t)
-            yaw_d = sampler.get_yaw_from_velocity(vel_d, default_yaw=0.0)
+            # Negate yaw to match environment convention (camera follows trajectory)
+            yaw_d = -sampler.get_yaw_from_velocity(vel_d, default_yaw=0.0)
         else:
             # Hover at final position
             pos_d = final_pos
