@@ -139,6 +139,87 @@ class TrajectoryPlanner:
                         )
         return None
 
+    def interpolate_z_between_waypoints(self, path, waypoints):
+        """
+        Interpolate Z values linearly between waypoints based on XY distance progress.
+
+        This fixes the voxel-snapping issue where Z drops to grid centers.
+        Keeps A* XY path for obstacle avoidance, but smooths Z between exact waypoints.
+
+        Args:
+            path: Full A* path as numpy array (N, 3)
+            waypoints: List of waypoints with exact Z values (includes start and destination)
+
+        Returns:
+            Path with interpolated Z values
+        """
+        path = np.array(path)
+        waypoints = np.array(waypoints)
+
+        if len(path) < 2 or len(waypoints) < 2:
+            return path
+
+        # Find which waypoint each path point is closest to (to determine segment)
+        # Map each path point to a segment between consecutive waypoints
+
+        # First, find the path indices closest to each waypoint
+        waypoint_path_indices = []
+        for wp in waypoints:
+            distances = np.linalg.norm(path[:, :2] - wp[:2], axis=1)  # XY distance only
+            idx = np.argmin(distances)
+            waypoint_path_indices.append(idx)
+
+        # Ensure indices are sorted and unique
+        waypoint_path_indices = sorted(set(waypoint_path_indices))
+
+        # Make sure first and last path points are included
+        if waypoint_path_indices[0] != 0:
+            waypoint_path_indices.insert(0, 0)
+        if waypoint_path_indices[-1] != len(path) - 1:
+            waypoint_path_indices.append(len(path) - 1)
+
+        # Get the exact Z values at waypoint positions
+        waypoint_z_values = []
+        for idx in waypoint_path_indices:
+            # Find the closest original waypoint to get exact Z
+            distances = np.linalg.norm(waypoints[:, :2] - path[idx, :2], axis=1)
+            closest_wp_idx = np.argmin(distances)
+            waypoint_z_values.append(waypoints[closest_wp_idx, 2])
+
+        # Interpolate Z for each segment
+        interpolated_path = path.copy()
+
+        for seg_idx in range(len(waypoint_path_indices) - 1):
+            start_path_idx = waypoint_path_indices[seg_idx]
+            end_path_idx = waypoint_path_indices[seg_idx + 1]
+
+            start_z = waypoint_z_values[seg_idx]
+            end_z = waypoint_z_values[seg_idx + 1]
+
+            # Get segment points
+            segment = path[start_path_idx:end_path_idx + 1]
+
+            if len(segment) < 2:
+                continue
+
+            # Calculate cumulative XY distance along segment
+            xy_diffs = np.diff(segment[:, :2], axis=0)
+            xy_distances = np.linalg.norm(xy_diffs, axis=1)
+            cumulative_dist = np.insert(np.cumsum(xy_distances), 0, 0)
+            total_dist = cumulative_dist[-1]
+
+            if total_dist > 0:
+                # Normalize to [0, 1] progress
+                progress = cumulative_dist / total_dist
+                # Linear interpolation of Z
+                interpolated_z = start_z + progress * (end_z - start_z)
+                interpolated_path[start_path_idx:end_path_idx + 1, 2] = interpolated_z
+            else:
+                # No XY movement, just use start Z
+                interpolated_path[start_path_idx:end_path_idx + 1, 2] = start_z
+
+        return interpolated_path
+
     def resample_trajectory_with_waypoints(self, full_path, waypoints, step_size=2.0):
         """
         Resample trajectory to ensure waypoints are included.
@@ -254,6 +335,14 @@ class TrajectoryPlanner:
 
         # Convert the full path to a NumPy array
         trajectory_points = np.array(full_path)
+
+        # Interpolate Z values between waypoints to fix voxel-snapping artifacts
+        # This keeps A* XY path for obstacle avoidance but gives smooth/exact Z values
+        trajectory_points = self.interpolate_z_between_waypoints(trajectory_points, waypoints)
+        full_path = trajectory_points.tolist()
+
+        if self.verbose:
+            print(f"Trajectory {idx+1}: Z values interpolated between waypoints.")
 
         # Resample the trajectory between waypoints to ensure waypoints are included
         resampled_trajectory = self.resample_trajectory_with_waypoints(full_path, waypoints, step_size=self.wp_distance)
