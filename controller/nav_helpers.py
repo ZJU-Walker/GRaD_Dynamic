@@ -42,15 +42,13 @@ def get_path(
         path: List of [x, y, z] points forming the path
         planner: TrajectoryPlanner instance
     """
-    print_info("Planning path with A* algorithm...")
-
-    # Initialize trajectory planner
+    # Initialize trajectory planner (verbose=False to suppress internal prints)
     planner = TrajectoryPlanner(
         ply_file=ply_file,
         safety_distance=safety_distance,
         batch_size=1,
         wp_distance=wp_distance,
-        verbose=True,
+        verbose=False,
     )
 
     # Convert to tensors
@@ -59,21 +57,16 @@ def get_path(
     waypoints_tensor = [torch.tensor(waypoints, device='cuda:0')]
 
     # Plan trajectory
-    start_time = time.time()
     trajectories = planner.plan_trajectories(
         current_pos_tensor,
         destination_tensor,
         waypoints_tensor,
     )
-    elapsed = time.time() - start_time
 
     if trajectories[0] is None:
-        print_warning("Path planning failed! Using direct waypoints.")
         path = [current_pos] + waypoints + [destination]
     else:
         path = trajectories[0]
-        print_ok(f"Path planned successfully in {elapsed:.2f}s")
-        print(f"  Path length: {len(path)} points")
 
     return path, planner
 
@@ -99,10 +92,7 @@ def generate_bspline_trajectory_from_path(
     Returns:
         BSplineTrajectorySampler for querying trajectory
     """
-    print_info("Generating B-Spline trajectory...")
-
     path_array = np.array(path)
-    print(f"  Input waypoints: {len(path_array)}")
 
     # Generate B-spline trajectory
     sampler = generate_bspline_trajectory(
@@ -110,9 +100,6 @@ def generate_bspline_trajectory_from_path(
         v_avg=v_avg,
         corner_smoothing=corner_smoothing,
     )
-
-    print_ok(f"B-Spline trajectory generated: {sampler.total_time:.2f}s duration")
-    print(f"  Corner smoothing: {corner_smoothing}")
 
     return sampler
 
@@ -134,8 +121,6 @@ def save_trajectory_profile(
         Dictionary with trajectory data (time, pos, vel, acc)
     """
     import matplotlib.pyplot as plt
-
-    print_info("Saving trajectory profile...")
 
     # Sample trajectory
     times = np.arange(0, sampler.total_time, dt)
@@ -206,7 +191,6 @@ def save_trajectory_profile(
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
-    print_ok(f"Trajectory profile saved: {output_path}")
     plt.close()
 
     return {
@@ -346,8 +330,6 @@ def save_trajectory_topdown(
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
     plt.close()
-
-    print_ok(f"Trajectory views saved: {output_path}")
 
 
 def fly_trajectory(
@@ -501,10 +483,7 @@ def render_and_save(
     import cv2
 
     if len(frames) == 0:
-        print_warning("No frames to save!")
         return
-
-    print_info(f"Saving video to {output_path}...")
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
@@ -539,11 +518,9 @@ def render_and_save(
             process.wait()
 
             if process.returncode == 0:
-                print_ok(f"Video saved: {output_path}")
-                print(f"  Resolution: {width}x{height}, Duration: {len(frames)/fps:.1f}s")
                 return
-        except Exception as e:
-            print_warning(f"ffmpeg error: {e}")
+        except Exception:
+            pass  # Fall through to OpenCV fallback
 
     # Fallback to OpenCV
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -551,7 +528,6 @@ def render_and_save(
     for frame in frames:
         out.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
     out.release()
-    print_ok(f"Video saved (mp4v): {output_path}")
 
 
 def save_trajectory_plot(
@@ -603,7 +579,6 @@ def save_trajectory_plot(
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150)
-    print_ok(f"Trajectory plot saved: {output_path}")
     plt.close()
 
 
@@ -623,8 +598,6 @@ def save_trajectory_3d_plot(
         output_path: Path to save the image (.png)
     """
     import matplotlib.pyplot as plt
-
-    print_info(f"Generating 3D trajectory plot...")
 
     actual = np.array(trajectory_actual)
     desired = np.array(trajectory_desired)
@@ -703,7 +676,6 @@ def save_trajectory_3d_plot(
     plt.tight_layout()
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     plt.savefig(output_path, dpi=150)
-    print_ok(f"3D trajectory plot saved: {output_path}")
     plt.close()
 
 
@@ -741,5 +713,3 @@ def save_trajectory_data(
             for i in range(len(actual)):
                 f.write(f"{times[i]:.3f} {actual[i,0]:.4f} {actual[i,1]:.4f} {actual[i,2]:.4f} "
                         f"{desired[i,0]:.4f} {desired[i,1]:.4f} {desired[i,2]:.4f} {errors[i]:.4f}\n")
-
-    print_ok(f"Trajectory data saved: {output_path}")
