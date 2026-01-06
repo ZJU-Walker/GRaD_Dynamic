@@ -143,7 +143,7 @@ def main():
                         help='Maximum simulation steps')
     parser.add_argument('--fps', type=int, default=25,
                         help='Output video FPS')
-    parser.add_argument('--v_avg', type=float, default=1.5,
+    parser.add_argument('--v_avg', type=float, default=0.5,
                         help='Average velocity for trajectory (m/s)')
     parser.add_argument('--corner_smoothing', type=float, default=0.18,
                         help='B-spline corner smoothing (0=sharp, 0.5=moderate, 1+=very smooth)')
@@ -252,11 +252,6 @@ def main():
         min_thrust=2.0,
         max_rate=1.0,  # rad/s
     )
-
-    print_info("Controller initialized")
-    print(f"  Mass: {controller.m} kg")
-    print(f"  Kp: {controller.Kp}")
-    print(f"  Kv: {controller.Kv}")
 
     # 7. Fly through trajectory
     frames, traj_actual, traj_desired, errors = fly_trajectory(
