@@ -1,3 +1,4 @@
+# TODO: Found a way to solve the A star z issue, currently just using linear interpolation between waypoints
 """
 Global Trajectory Planner using A* Algorithm
 
