@@ -314,6 +314,13 @@ class VelNetTrainer:
                     # Precompute rot6d for all frames
                     rot6d_all = quaternion_to_rot6d(orientations)  # (seq_len, 6)
 
+                    # Precompute GT deltas for the entire sequence (always GT-based)
+                    # delta_gt[t] = vel_gt[t] - vel_gt[t-1]
+                    # This ensures stable targets regardless of scheduled sampling
+                    deltas_gt_raw = torch.zeros_like(velocities_gt_raw)
+                    deltas_gt_raw[0] = velocities_gt_raw[0] - prev_vel_raw  # First frame
+                    deltas_gt_raw[1:] = velocities_gt_raw[1:] - velocities_gt_raw[:-1]  # Rest
+
                     # Sequential GRU loop (needed for scheduled sampling)
                     for t in range(seq_length):
                         obs = torch.cat([
@@ -328,9 +335,8 @@ class VelNetTrainer:
                         # Model outputs DELTA (normalized)
                         delta_mu_norm, _ = self.model.encode_step(obs)
 
-                        # Compute GT delta (raw, then normalize)
-                        vel_gt_raw = velocities_gt_raw[t:t+1]
-                        delta_gt_raw = vel_gt_raw - prev_vel_raw_current.unsqueeze(0)
+                        # GT delta: ALWAYS from GT velocities (not from potentially wrong prev_vel)
+                        delta_gt_raw = deltas_gt_raw[t:t+1]
                         delta_gt_norm = self.normalize_delta(delta_gt_raw)
 
                         # Loss on normalized delta
@@ -338,9 +344,10 @@ class VelNetTrainer:
                         batch_loss += loss
                         batch_frames += 1
 
-                        # Reconstruct velocity for monitoring and next step
+                        # Reconstruct velocity for next step
                         delta_pred_raw = self.denormalize_delta(delta_mu_norm)
                         vel_pred_raw = prev_vel_raw_current.unsqueeze(0) + delta_pred_raw
+                        vel_gt_raw = velocities_gt_raw[t:t+1]
 
                         # Track velocity reconstruction error (for monitoring)
                         batch_vel_error += F.l1_loss(vel_pred_raw, vel_gt_raw).item()
