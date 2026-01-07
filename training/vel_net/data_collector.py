@@ -273,6 +273,10 @@ class DataCollector:
             elif done:
                 fail_reason = 'timeout'
                 break
+        else:
+            # Loop completed without break - check if trajectory finished
+            if t < total_time:
+                fail_reason = 'timeout'  # max_steps reached before trajectory completed
 
         # Complete progress bar
         if pbar is not None:
