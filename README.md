@@ -120,19 +120,34 @@ python training/vel_net/train_vel_net.py train \
 | `--checkpoint_dir` | Checkpoint directory | `checkpoints/vel_net` |
 | `--resume` | Resume from checkpoint | None |
 
-**Training stages:**
-- **Stage A (Imitation)**: Pure supervised loss (MSE)
-- **Stage B (PINN)**: Supervised + Physics-Informed loss
+**Training Stages (Curriculum Learning):**
+
+| Stage | Name | Loss | Description |
+|-------|------|------|-------------|
+| **A** | Imitation | MSE | Pure supervised learning - match ground truth velocity |
+| **B** | PINN | MSE + Physics | Adds physics-informed constraints after Stage A plateaus |
+
+- Training starts in **Stage A** with simple MSE loss
+- After validation loss stops improving for `stage_patience` epochs (default: 20), transitions to **Stage B**
+- **Stage B** adds physics-informed regularization to improve generalization
+- Early stopping triggers after `early_stop_patience` epochs (default: 30) without improvement in Stage B
+
+**Progress bar output:**
+```
+Training:  10%|████          | 50/500 [02:30<22:30] stage=A, loss=0.0234, val_mae=0.0156, lr=1.0e-04
+Epoch  50 [A]: 100%|████████████████████| 542/542 [00:03] loss=0.0234, mse=0.0234
+```
 
 ### 3. Evaluation
 
 Test auto-regressive inference:
 
 ```bash
-python training/vel_net/train_vel_net.py test \
-    --checkpoint checkpoints/vel_net/best.pt \
-    --test_seq data/vel_net/sequences/seq_0000 \
-    --max_steps 300
+python training/vel_net/train_vel_net.py eval \
+      --checkpoint checkpoints/vel_net/best.pt \
+      --map gate_mid \
+      --v_avg 1.0 \
+      --output_dir output/vel_net_eval
 ```
 
 ---
