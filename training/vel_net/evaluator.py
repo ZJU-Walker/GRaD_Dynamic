@@ -1,0 +1,404 @@
+"""
+Velocity Network Evaluator.
+
+Flies the drone through a trajectory and compares vel_net predictions
+with ground truth velocities. Saves video and velocity plots.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
+import numpy as np
+import torch
+from typing import Dict
+from tqdm import tqdm
+
+from envs.drone_env import SimpleDroneEnv
+from controller.geometric_controller import GeometricController
+from controller.nav_helpers import (
+    get_path,
+    generate_bspline_trajectory_from_path,
+    render_and_save,
+)
+from models.vel_net import VELO_NET
+from models.vel_net.visual_encoder import DualEncoder
+from models.vel_net.vel_obs_utils import quaternion_to_rot6d
+
+
+# Map configurations (same as waypoint_nav_geometric.py)
+MAP_CONFIGS = {
+    "gate_mid": {
+        "start": [-6.0, 0.0, 1.2],
+        "waypoints": [
+            [-0.2, -0.1, 1.2],
+            [1.6, 0.7, 1.1],
+            [3.7, 1.5, 0.7],
+            [5.8, 0.0, 0.9],
+        ],
+        "destination": [7.5, -2.0, 1.2],
+    },
+    "gate_left": {
+        "start": [-6.0, 0.0, 1.2],
+        "waypoints": [
+            [-0.2, 1.2, 1.4],
+            [3.7, 1.2, 0.6],
+            [5.8, 0.0, 1.2],
+        ],
+        "destination": [7.0, -2.0, 1.2],
+    },
+    "gate_right": {
+        "start": [-6.0, 0.0, 1.3],
+        "waypoints": [
+            [-3.0, -1.0, 1.3],
+            [0.0, -1.4, 1.5],
+            [1.8, 0.6, 1.1],
+            [3.7, 1.4, 0.7],
+            [5.8, 0.0, 1.3],
+        ],
+        "destination": [7.0, -2.0, 1.3],
+    },
+}
+
+PC_TO_SIM_OFFSET = np.array([6.0, 0.0, 0.0])
+
+
+def fly_and_evaluate(
+    model: VELO_NET,
+    encoder: DualEncoder,
+    map_name: str = 'gate_mid',
+    v_avg: float = 1.0,
+    output_dir: str = 'output/vel_net_eval',
+    device: str = 'cuda:0',
+    max_steps: int = 3000,
+    smoothing: float = 0.18,
+) -> Dict[str, float]:
+    """
+    Fly drone through trajectory and evaluate vel_net predictions.
+
+    Args:
+        model: Trained VELO_NET model
+        encoder: Trained DualEncoder
+        map_name: Map name
+        v_avg: Average velocity (m/s)
+        output_dir: Output directory for video and plots
+        device: PyTorch device
+        max_steps: Maximum simulation steps
+        smoothing: B-spline corner smoothing
+
+    Returns:
+        Dict with evaluation metrics
+    """
+    model.eval()
+    encoder.eval()
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"Velocity Network Evaluation Flight")
+    print(f"{'='*60}")
+    print(f"  Map: {map_name}")
+    print(f"  Velocity: {v_avg} m/s")
+    print(f"  Output: {output_dir}")
+    print(f"{'='*60}\n")
+
+    # 1. Setup trajectory (same as waypoint_nav_geometric.py)
+    config = MAP_CONFIGS[map_name]
+    start_pos_pc = config["start"]
+    waypoints_pc = config["waypoints"]
+    destination_pc = config["destination"]
+
+    # Get A* path
+    ply_file = Path(__file__).parent.parent.parent / "envs" / "assets" / "point_cloud" / "sv_1007_gate_mid.ply"
+    path_pc, _ = get_path(
+        current_pos=start_pos_pc,
+        waypoints=waypoints_pc,
+        destination=destination_pc,
+        ply_file=str(ply_file),
+        wp_distance=0.5,
+    )
+
+    # Convert to simulation space
+    path_sim = [np.array(p) + PC_TO_SIM_OFFSET for p in path_pc]
+    start_pos_sim = np.array(start_pos_pc) + PC_TO_SIM_OFFSET
+
+    # Generate B-spline trajectory
+    sampler = generate_bspline_trajectory_from_path(
+        path=path_sim,
+        v_avg=v_avg,
+        corner_smoothing=smoothing,
+    )
+
+    # 2. Initialize environment
+    print("Initializing environment...")
+    env = SimpleDroneEnv(
+        map_name=map_name,
+        device=device,
+        num_envs=1,
+        episode_length=max_steps,
+        render_resolution=1.0,
+    )
+    env.reset(start_position=start_pos_sim.tolist())
+
+    # 3. Initialize controller
+    controller = GeometricController(
+        mass=env.mass,
+        gravity=9.81,
+        Kp=np.array([1.5, 1.5, 0.5]),
+        Kv=np.array([2.0, 2.0, 1.5]),
+        Kr=np.array([3.0, 3.0, 2.0]),
+        Kw=np.array([0.8, 0.8, 0.5]),
+        max_thrust=env.max_thrust,
+        min_thrust=2.0,
+        max_rate=1.0,
+    )
+
+    # 4. Fly and collect data
+    frames = []
+    vel_gt_list = []
+    vel_pred_list = []
+    timestamps = []
+
+    dt = 1.0 / env.sim_freq  # Use env's sim frequency
+    total_time = sampler.total_time + 2.0  # Extra hover time
+    final_pos, _, _, _ = sampler.sample(sampler.total_time)
+    start_pos_d, _, _, _ = sampler.sample(0.0)
+    stabilize_steps = 50
+
+    # Initialize prev_vel for auto-regressive inference
+    prev_vel = torch.zeros(1, 3, device=device)
+    prev_action = torch.zeros(1, 4, device=device)
+
+    print(f"Flying trajectory ({sampler.total_time:.1f}s)...")
+    pbar = tqdm(total=max_steps, desc='Flight', unit='step')
+
+    for step in range(max_steps):
+        t = max(0, (step - stabilize_steps) * dt)
+
+        if t > total_time:
+            print(f"\nTrajectory completed at step {step}")
+            break
+
+        # Get current state
+        state = env.get_state()
+        pos = state['position'][0].cpu().numpy()
+        vel_gt = state['velocity'][0].cpu().numpy()
+        quat_xyzw = state['orientation'][0].cpu().numpy()
+        omega = state['angular_velocity'][0].cpu().numpy()
+
+        # Compute control action first
+        quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+
+        if step < stabilize_steps:
+            pos_d = start_pos_d
+            vel_d = np.zeros(3)
+            acc_d = np.zeros(3)
+            yaw_d = 0.0
+        elif t <= sampler.total_time:
+            pos_d, vel_d, acc_d, _ = sampler.sample(t)
+            yaw_d = -sampler.get_yaw_from_velocity(vel_d, default_yaw=0.0)
+        else:
+            pos_d = final_pos
+            vel_d = np.zeros(3)
+            acc_d = np.zeros(3)
+            yaw_d = 0.0
+
+        thrust, omega_cmd, _ = controller.compute_from_quaternion(
+            pos, vel_gt, quat_wxyz, omega,
+            pos_d, vel_d, acc_d, yaw_d
+        )
+
+        rate_scale = 0.5
+        action = np.array([
+            np.clip(omega_cmd[0] / rate_scale, -1.0, 1.0),
+            np.clip(-omega_cmd[1] / rate_scale, -1.0, 1.0),
+            np.clip(omega_cmd[2] / rate_scale, -1.0, 1.0),
+            np.clip(thrust / controller.max_thrust, 0.0, 1.0),
+        ])
+
+        # Step environment - returns rgb, depth
+        _, rgb, depth, done, info = env.step(action)
+
+        # rgb: (1, H, W, 3), depth: (1, H, W, 1)
+        rgb_np = rgb[0].cpu().numpy()  # (H, W, 3)
+        depth_np = depth[0].cpu().numpy().squeeze()  # (H, W)
+
+        # Predict velocity with vel_net (after stabilization)
+        if step >= stabilize_steps:
+            with torch.no_grad():
+                # Prepare images - normalize RGB
+                if rgb_np.max() > 1.0:
+                    rgb_normalized = rgb_np.astype(np.float32) / 255.0
+                else:
+                    rgb_normalized = rgb_np.astype(np.float32)
+
+                rgb_tensor = torch.from_numpy(rgb_normalized)
+                rgb_tensor = rgb_tensor.permute(2, 0, 1).unsqueeze(0).to(device)  # (1, 3, H, W)
+
+                depth_tensor = torch.from_numpy(depth_np.astype(np.float32))
+                depth_tensor = depth_tensor.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, H, W)
+
+                # Encode images
+                rgb_feat, depth_feat = encoder(rgb_tensor, depth_tensor)
+
+                # Build observation
+                quat_tensor = torch.from_numpy(quat_xyzw.astype(np.float32)).unsqueeze(0).to(device)
+                rot6d = quaternion_to_rot6d(quat_tensor)
+
+                action_tensor = torch.from_numpy(action.astype(np.float32)).unsqueeze(0).to(device)
+
+                obs = torch.cat([
+                    rot6d,           # 6
+                    action_tensor,   # 4
+                    prev_action,     # 4
+                    prev_vel,        # 3
+                    rgb_feat,        # 32
+                    depth_feat,      # 32
+                ], dim=1)
+
+                # Predict velocity
+                vel_mu, _ = model.encode(obs)
+                vel_pred = vel_mu[0].cpu().numpy()
+
+                # Update prev_vel for next step (auto-regressive)
+                prev_vel = vel_mu.detach()
+
+            # Record data
+            vel_gt_list.append(vel_gt.copy())
+            vel_pred_list.append(vel_pred.copy())
+            timestamps.append(t)
+
+        # Update prev_action for next step
+        prev_action = torch.from_numpy(action.astype(np.float32)).unsqueeze(0).to(device)
+
+        # Record frame for video
+        if step % 2 == 0:
+            if rgb_np.max() <= 1.0:
+                frame = (rgb_np * 255).astype(np.uint8)
+            else:
+                frame = rgb_np.astype(np.uint8)
+            frames.append(frame)
+
+        # Check for collision/done
+        if info.get('collision', False) or done:
+            print(f"\nFlight ended: collision={info.get('collision', False)}, done={done}")
+            break
+
+        pbar.update(1)
+        if len(vel_pred_list) > 0:
+            pbar.set_postfix({
+                't': f'{t:.1f}s',
+                'vel_err': f'{np.linalg.norm(vel_pred_list[-1] - vel_gt_list[-1]):.3f}',
+            })
+
+    pbar.close()
+    env.close()
+
+    # Convert to arrays
+    vel_gt_arr = np.array(vel_gt_list)
+    vel_pred_arr = np.array(vel_pred_list)
+    timestamps_arr = np.array(timestamps)
+
+    # Compute metrics
+    errors = np.abs(vel_pred_arr - vel_gt_arr)
+    metrics = {
+        'mae': np.mean(errors),
+        'mae_x': np.mean(errors[:, 0]),
+        'mae_y': np.mean(errors[:, 1]),
+        'mae_z': np.mean(errors[:, 2]),
+        'rmse': np.sqrt(np.mean(errors**2)),
+        'max_error': np.max(errors),
+    }
+
+    print(f"\n{'='*60}")
+    print(f"Evaluation Results")
+    print(f"{'='*60}")
+    print(f"  MAE: {metrics['mae']:.4f} m/s")
+    print(f"  MAE (x,y,z): [{metrics['mae_x']:.4f}, {metrics['mae_y']:.4f}, {metrics['mae_z']:.4f}]")
+    print(f"  RMSE: {metrics['rmse']:.4f} m/s")
+    print(f"  Max Error: {metrics['max_error']:.4f} m/s")
+    print(f"{'='*60}\n")
+
+    # Save video
+    video_path = output_dir / f'eval_{map_name}_v{v_avg}.mp4'
+    render_and_save(frames, str(video_path), fps=25)
+    print(f"Video saved: {video_path}")
+
+    # Save velocity plot
+    plot_path = output_dir / f'eval_{map_name}_v{v_avg}_velocity.png'
+    save_velocity_plot(timestamps_arr, vel_gt_arr, vel_pred_arr, metrics, str(plot_path))
+    print(f"Plot saved: {plot_path}")
+
+    # Save data
+    data_path = output_dir / f'eval_{map_name}_v{v_avg}_data.npz'
+    np.savez(
+        data_path,
+        timestamps=timestamps_arr,
+        vel_gt=vel_gt_arr,
+        vel_pred=vel_pred_arr,
+        metrics=metrics,
+    )
+    print(f"Data saved: {data_path}")
+
+    return metrics
+
+
+def save_velocity_plot(
+    timestamps: np.ndarray,
+    vel_gt: np.ndarray,
+    vel_pred: np.ndarray,
+    metrics: dict,
+    output_path: str,
+):
+    """Save velocity comparison plot."""
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=True)
+
+    # Velocity X
+    axes[0].plot(timestamps, vel_gt[:, 0], 'b-', label='GT', linewidth=1.5)
+    axes[0].plot(timestamps, vel_pred[:, 0], 'r--', label='Pred', linewidth=1.5, alpha=0.8)
+    axes[0].fill_between(timestamps, vel_gt[:, 0], vel_pred[:, 0], alpha=0.2, color='red')
+    axes[0].set_ylabel('Vel X (m/s)')
+    axes[0].legend(loc='upper right')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].set_title(f'Velocity Prediction (Auto-regressive) | MAE: {metrics["mae"]:.4f} m/s | RMSE: {metrics["rmse"]:.4f} m/s')
+
+    # Velocity Y
+    axes[1].plot(timestamps, vel_gt[:, 1], 'b-', label='GT', linewidth=1.5)
+    axes[1].plot(timestamps, vel_pred[:, 1], 'r--', label='Pred', linewidth=1.5, alpha=0.8)
+    axes[1].fill_between(timestamps, vel_gt[:, 1], vel_pred[:, 1], alpha=0.2, color='red')
+    axes[1].set_ylabel('Vel Y (m/s)')
+    axes[1].legend(loc='upper right')
+    axes[1].grid(True, alpha=0.3)
+
+    # Velocity Z
+    axes[2].plot(timestamps, vel_gt[:, 2], 'b-', label='GT', linewidth=1.5)
+    axes[2].plot(timestamps, vel_pred[:, 2], 'r--', label='Pred', linewidth=1.5, alpha=0.8)
+    axes[2].fill_between(timestamps, vel_gt[:, 2], vel_pred[:, 2], alpha=0.2, color='red')
+    axes[2].set_ylabel('Vel Z (m/s)')
+    axes[2].legend(loc='upper right')
+    axes[2].grid(True, alpha=0.3)
+
+    # Velocity magnitude
+    vel_mag_gt = np.linalg.norm(vel_gt, axis=1)
+    vel_mag_pred = np.linalg.norm(vel_pred, axis=1)
+    axes[3].plot(timestamps, vel_mag_gt, 'b-', label='GT', linewidth=1.5)
+    axes[3].plot(timestamps, vel_mag_pred, 'r--', label='Pred', linewidth=1.5, alpha=0.8)
+    axes[3].fill_between(timestamps, vel_mag_gt, vel_mag_pred, alpha=0.2, color='red')
+    axes[3].set_ylabel('Vel Mag (m/s)')
+    axes[3].set_xlabel('Time (s)')
+    axes[3].legend(loc='upper right')
+    axes[3].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
+
+
+if __name__ == '__main__':
+    print("Evaluator module loaded successfully")
