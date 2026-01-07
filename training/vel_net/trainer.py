@@ -114,6 +114,10 @@ class VelNetTrainer:
         self.best_ar_mae = float('inf')
         self.epochs_without_improvement = 0
 
+        # Compute velocity normalization stats from training data
+        self.vel_mean, self.vel_std = self._compute_velocity_stats()
+        print(f"  Velocity normalization: mean={self.vel_mean}, std={self.vel_std}")
+
         # Wandb
         self.use_wandb = use_wandb and WANDB_AVAILABLE
         if self.use_wandb:
@@ -127,6 +131,29 @@ class VelNetTrainer:
                     'model_params': sum(p.numel() for p in model.parameters()),
                 },
             )
+
+    def _compute_velocity_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute velocity mean and std from training data for normalization."""
+        all_vels = []
+        for batch in self.train_loader:
+            for vel_gt in batch['velocities_gt']:
+                all_vels.append(vel_gt.numpy())
+        all_vels = np.concatenate(all_vels, axis=0)
+
+        vel_mean = torch.from_numpy(all_vels.mean(axis=0).astype(np.float32)).to(self.device)
+        vel_std = torch.from_numpy(all_vels.std(axis=0).astype(np.float32)).to(self.device)
+        # Prevent division by zero
+        vel_std = torch.clamp(vel_std, min=1e-6)
+
+        return vel_mean, vel_std
+
+    def normalize_velocity(self, vel: torch.Tensor) -> torch.Tensor:
+        """Normalize velocity to zero-mean, unit-variance."""
+        return (vel - self.vel_mean) / self.vel_std
+
+    def denormalize_velocity(self, vel_norm: torch.Tensor) -> torch.Tensor:
+        """Denormalize velocity back to original scale."""
+        return vel_norm * self.vel_std + self.vel_mean
 
     def get_teacher_forcing_ratio(self) -> float:
         """
@@ -161,15 +188,18 @@ class VelNetTrainer:
 
         return rgb_tensor, depth_tensor
 
-    def _load_backbone_features(self, seq_path: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Load precomputed backbone features for a sequence (cached)."""
+    def _load_backbone_features(self, seq_path: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load precomputed backbone features for a sequence (cached on GPU)."""
         if not hasattr(self, '_feature_cache'):
             self._feature_cache = {}
 
         if seq_path not in self._feature_cache:
             feature_path = Path(seq_path) / "backbone_features.npz"
             features = np.load(feature_path)
-            self._feature_cache[seq_path] = (features['rgb_features'], features['depth_features'])
+            # Convert to tensor and move to GPU once (cached)
+            rgb_tensor = torch.from_numpy(features['rgb_features']).to(self.device)
+            depth_tensor = torch.from_numpy(features['depth_features']).to(self.device)
+            self._feature_cache[seq_path] = (rgb_tensor, depth_tensor)
 
         return self._feature_cache[seq_path]
 
@@ -183,7 +213,7 @@ class VelNetTrainer:
         return True
 
     def train_epoch(self, pbar: tqdm = None) -> Dict[str, float]:
-        """Train for one epoch with scheduled sampling (uses precomputed features)."""
+        """Train for one epoch with scheduled sampling (uses precomputed features + AMP)."""
         from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 
         self.model.train()
@@ -196,72 +226,81 @@ class VelNetTrainer:
         total_pred_frames = 0
         n_sequences = 0
 
+        # Use AMP for faster training
+        scaler = torch.cuda.amp.GradScaler()
+
         for batch in self.train_loader:
             batch_loss = 0.0
             batch_frames = 0
 
-            for b_idx in range(len(batch['seq_paths'])):
-                seq_path = batch['seq_paths'][b_idx]
-                frame_indices = batch['frame_indices'][b_idx]
-                orientations = batch['orientations'][b_idx].to(self.device)
-                actions = batch['actions'][b_idx].to(self.device)
-                prev_actions = batch['prev_actions'][b_idx].to(self.device)
-                velocities_gt = batch['velocities_gt'][b_idx].to(self.device)
-                prev_vel = batch['initial_prev_vels'][b_idx].to(self.device)
+            with torch.cuda.amp.autocast():
+                for b_idx in range(len(batch['seq_paths'])):
+                    seq_path = batch['seq_paths'][b_idx]
+                    frame_indices = batch['frame_indices'][b_idx]
+                    orientations = batch['orientations'][b_idx].to(self.device)
+                    actions = batch['actions'][b_idx].to(self.device)
+                    prev_actions = batch['prev_actions'][b_idx].to(self.device)
+                    velocities_gt_raw = batch['velocities_gt'][b_idx].to(self.device)
+                    prev_vel_raw = batch['initial_prev_vels'][b_idx].to(self.device)
 
-                # Load precomputed backbone features for this sequence
-                rgb_backbone, depth_backbone = self._load_backbone_features(seq_path)
+                    # Normalize velocities (zero-mean, unit-variance per axis)
+                    velocities_gt = self.normalize_velocity(velocities_gt_raw)
+                    prev_vel = self.normalize_velocity(prev_vel_raw)
 
-                seq_length = len(frame_indices)
-                self.model.reset_hidden_state(batch_size=1)
+                    # Load precomputed backbone features (already on GPU)
+                    rgb_backbone, depth_backbone = self._load_backbone_features(seq_path)
 
-                for t in range(seq_length):
-                    frame_idx = frame_indices[t]
+                    seq_length = len(frame_indices)
+                    self.model.reset_hidden_state(batch_size=1)
 
-                    # Get precomputed 576-dim backbone features
-                    rgb_bb = torch.from_numpy(rgb_backbone[frame_idx:frame_idx+1]).to(self.device)
-                    depth_bb = torch.from_numpy(depth_backbone[frame_idx:frame_idx+1]).to(self.device)
+                    # Batch FC layer: process ALL frames at once (576 -> 32)
+                    frame_idx_tensor = torch.tensor(frame_indices, device=self.device)
+                    rgb_bb_all = rgb_backbone[frame_idx_tensor]  # (seq_len, 576)
+                    depth_bb_all = depth_backbone[frame_idx_tensor]  # (seq_len, 576)
+                    rgb_feat_all, depth_feat_all = self.encoder.forward_from_backbone_features(rgb_bb_all, depth_bb_all)
 
-                    # Apply trainable FC layer only (576 -> 32)
-                    rgb_feat, depth_feat = self.encoder.forward_from_backbone_features(rgb_bb, depth_bb)
+                    # Precompute rot6d for all frames
+                    rot6d_all = quaternion_to_rot6d(orientations)  # (seq_len, 6)
 
-                    quat = orientations[t:t+1]
-                    rot6d = quaternion_to_rot6d(quat)
-                    action = actions[t:t+1]
-                    prev_action = prev_actions[t:t+1]
+                    # Sequential GRU loop (needed for scheduled sampling)
+                    for t in range(seq_length):
+                        obs = torch.cat([
+                            rot6d_all[t:t+1],
+                            actions[t:t+1],
+                            prev_actions[t:t+1],
+                            prev_vel.unsqueeze(0),
+                            rgb_feat_all[t:t+1],
+                            depth_feat_all[t:t+1],
+                        ], dim=1)
 
-                    obs = torch.cat([
-                        rot6d, action, prev_action,
-                        prev_vel.unsqueeze(0),
-                        rgb_feat, depth_feat,
-                    ], dim=1)
+                        vel_mu, _ = self.model.encode_step(obs)
 
-                    vel_mu, _ = self.model.encode_step(obs)
+                        vel_gt = velocities_gt[t:t+1]
+                        loss = F.mse_loss(vel_mu, vel_gt)
+                        batch_loss += loss
+                        batch_frames += 1
 
-                    vel_gt = velocities_gt[t:t+1]
-                    loss = F.mse_loss(vel_mu, vel_gt)
-                    batch_loss += loss
-                    batch_frames += 1
+                        # Scheduled sampling: choose GT or predicted prev_vel
+                        if np.random.random() < tf_ratio:
+                            prev_vel = vel_gt.squeeze(0).detach()
+                            total_tf_frames += 1
+                        else:
+                            prev_vel = vel_mu.squeeze(0).detach()
+                            total_pred_frames += 1
 
-                    # Scheduled sampling: choose GT or predicted prev_vel
-                    if np.random.random() < tf_ratio:
-                        prev_vel = vel_gt.squeeze(0).detach()
-                        total_tf_frames += 1
-                    else:
-                        prev_vel = vel_mu.squeeze(0).detach()
-                        total_pred_frames += 1
-
-                n_sequences += 1
+                    n_sequences += 1
 
             if batch_frames > 0:
                 avg_loss = batch_loss / batch_frames
                 self.optimizer.zero_grad()
-                avg_loss.backward()
+                scaler.scale(avg_loss).backward()
+                scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     list(self.model.parameters()) + list(self.encoder.get_trainable_params()),
                     self.grad_clip
                 )
-                self.optimizer.step()
+                scaler.step(self.optimizer)
+                scaler.update()
                 total_loss += avg_loss.item()
 
             if pbar is not None:
@@ -302,46 +341,50 @@ class VelNetTrainer:
                 orientations = batch['orientations'][b_idx].to(self.device)
                 actions = batch['actions'][b_idx].to(self.device)
                 prev_actions = batch['prev_actions'][b_idx].to(self.device)
-                velocities_gt = batch['velocities_gt'][b_idx].to(self.device)
-                prev_vel = batch['initial_prev_vels'][b_idx].to(self.device)
+                velocities_gt_raw = batch['velocities_gt'][b_idx].to(self.device)  # Keep raw for metrics
+                prev_vel_raw = batch['initial_prev_vels'][b_idx].to(self.device)
 
-                # Load precomputed backbone features for this sequence
+                # Normalize initial prev_vel for model input
+                prev_vel = self.normalize_velocity(prev_vel_raw)
+
+                # Load precomputed backbone features (already on GPU)
                 rgb_backbone, depth_backbone = self._load_backbone_features(seq_path)
 
                 seq_length = len(frame_indices)
                 self.model.reset_hidden_state(batch_size=1)
 
+                # Batch FC layer: process ALL frames at once
+                frame_idx_tensor = torch.tensor(frame_indices, device=self.device)
+                rgb_bb_all = rgb_backbone[frame_idx_tensor]
+                depth_bb_all = depth_backbone[frame_idx_tensor]
+                rgb_feat_all, depth_feat_all = self.encoder.forward_from_backbone_features(rgb_bb_all, depth_bb_all)
+
+                # Precompute rot6d for all frames
+                rot6d_all = quaternion_to_rot6d(orientations)
+
                 for t in range(seq_length):
-                    frame_idx = frame_indices[t]
-
-                    # Get precomputed 576-dim backbone features
-                    rgb_bb = torch.from_numpy(rgb_backbone[frame_idx:frame_idx+1]).to(self.device)
-                    depth_bb = torch.from_numpy(depth_backbone[frame_idx:frame_idx+1]).to(self.device)
-
-                    # Apply trainable FC layer only (576 -> 32)
-                    rgb_feat, depth_feat = self.encoder.forward_from_backbone_features(rgb_bb, depth_bb)
-
-                    quat = orientations[t:t+1]
-                    rot6d = quaternion_to_rot6d(quat)
-                    action = actions[t:t+1]
-                    prev_action = prev_actions[t:t+1]
-
                     obs = torch.cat([
-                        rot6d, action, prev_action,
-                        prev_vel.unsqueeze(0),
-                        rgb_feat, depth_feat,
+                        rot6d_all[t:t+1],
+                        actions[t:t+1],
+                        prev_actions[t:t+1],
+                        prev_vel.unsqueeze(0),  # Normalized
+                        rgb_feat_all[t:t+1],
+                        depth_feat_all[t:t+1],
                     ], dim=1)
 
-                    vel_mu, _ = self.model.encode_step(obs)
-                    vel_gt = velocities_gt[t:t+1]
+                    vel_mu_norm, _ = self.model.encode_step(obs)  # Model outputs normalized
+
+                    # Denormalize prediction for metrics (in m/s)
+                    vel_mu = self.denormalize_velocity(vel_mu_norm)
+                    vel_gt = velocities_gt_raw[t:t+1]  # Raw GT in m/s
 
                     error = torch.abs(vel_mu - vel_gt).cpu().numpy()[0]
                     all_errors.append(error)
                     total_mse += F.mse_loss(vel_mu, vel_gt).item()
                     total_frames += 1
 
-                    # Always use predicted for auto-regressive validation
-                    prev_vel = vel_mu.squeeze(0)
+                    # Auto-regressive: use normalized prediction as next prev_vel
+                    prev_vel = vel_mu_norm.squeeze(0)
 
         all_errors = np.array(all_errors)
         mae = np.mean(all_errors)
@@ -453,6 +496,9 @@ class VelNetTrainer:
                 'hidden_dim': self.model.hidden_dim,
                 'gru_layers': self.model.gru_layers,
             },
+            # Velocity normalization stats (needed for inference)
+            'vel_mean': self.vel_mean.cpu(),
+            'vel_std': self.vel_std.cpu(),
         }
         torch.save(checkpoint, path)
         print(f"  Saved: {path}")
@@ -473,6 +519,8 @@ def autoregressive_test(
     model: VELO_NET,
     encoder: DualEncoder,
     test_sequence_path: str,
+    vel_mean: torch.Tensor,
+    vel_std: torch.Tensor,
     device: str = 'cuda:0',
     max_steps: int = 300,
     save_plot: bool = True,
@@ -482,12 +530,20 @@ def autoregressive_test(
     Test model with auto-regressive inference.
 
     Feeds predicted velocity back as prev_vel input.
+    Model expects normalized inputs and outputs normalized predictions.
+
+    Args:
+        vel_mean: Velocity mean for normalization (3,)
+        vel_std: Velocity std for normalization (3,)
     """
     from PIL import Image
     from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 
     model.eval()
     encoder.eval()
+
+    vel_mean = vel_mean.to(device)
+    vel_std = vel_std.to(device)
 
     seq_path = Path(test_sequence_path)
     telemetry = np.load(seq_path / "telemetry.npz")
@@ -498,7 +554,11 @@ def autoregressive_test(
     all_gts = []
     errors = []
 
-    prev_vel = torch.zeros(1, 3, device=device)
+    # Start with zero velocity (normalized)
+    prev_vel_norm = (torch.zeros(1, 3, device=device) - vel_mean) / vel_std
+
+    # Reset GRU hidden state for sequential processing
+    model.reset_hidden_state(batch_size=1)
 
     with torch.no_grad():
         for t in range(1, n_frames):
@@ -519,10 +579,13 @@ def autoregressive_test(
             action = torch.from_numpy(telemetry['actions'][t].astype(np.float32)).unsqueeze(0).to(device)
             prev_action = torch.from_numpy(telemetry['actions'][t-1].astype(np.float32)).unsqueeze(0).to(device)
 
-            obs = torch.cat([rot6d, action, prev_action, prev_vel, rgb_feat, depth_feat], dim=1)
+            obs = torch.cat([rot6d, action, prev_action, prev_vel_norm, rgb_feat, depth_feat], dim=1)
 
-            vel_mu, _ = model.encode(obs)
-            prev_vel = vel_mu.detach()
+            vel_mu_norm, _ = model.encode_step(obs)  # Use encode_step for GRU state
+            prev_vel_norm = vel_mu_norm.detach()  # Keep normalized for next step
+
+            # Denormalize for metrics
+            vel_mu = vel_mu_norm * vel_std + vel_mean
 
             vel_gt = telemetry['velocities'][t]
             all_preds.append(vel_mu.cpu().numpy()[0])

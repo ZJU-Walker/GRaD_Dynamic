@@ -141,6 +141,8 @@ def train_command(args):
             model=model,
             encoder=encoder,
             test_sequence_path=test_seq,
+            vel_mean=trainer.vel_mean,
+            vel_std=trainer.vel_std,
             device=device,
         )
 
@@ -174,11 +176,18 @@ def test_command(args):
     print(f"Loaded checkpoint from {args.checkpoint}")
     print(f"  Epoch: {checkpoint['epoch']}")
 
+    # Load velocity normalization stats
+    vel_mean = checkpoint.get('vel_mean', torch.zeros(3))
+    vel_std = checkpoint.get('vel_std', torch.ones(3))
+    print(f"  Velocity norm: mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
+
     # Run test
     metrics = autoregressive_test(
         model=model,
         encoder=encoder,
         test_sequence_path=args.test_seq,
+        vel_mean=vel_mean,
+        vel_std=vel_std,
         device=device,
         max_steps=args.max_steps,
         save_plot=True,
@@ -213,10 +222,17 @@ def eval_command(args):
     print(f"Loaded checkpoint from {args.checkpoint}")
     print(f"  Epoch: {checkpoint['epoch']}")
 
+    # Load velocity normalization stats
+    vel_mean = checkpoint.get('vel_mean', torch.zeros(3))
+    vel_std = checkpoint.get('vel_std', torch.ones(3))
+    print(f"  Velocity norm: mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
+
     # Run evaluation flight
     fly_and_evaluate(
         model=model,
         encoder=encoder,
+        vel_mean=vel_mean,
+        vel_std=vel_std,
         map_name=args.map,
         v_avg=args.v_avg,
         output_dir=args.output_dir,
@@ -337,7 +353,7 @@ def main():
                              help='Map name')
     eval_parser.add_argument('--v_avg', type=float, default=1.0,
                              help='Average velocity (m/s)')
-    eval_parser.add_argument('--smoothing', type=float, default=0.18,
+    eval_parser.add_argument('--smoothing', type=float, default=0.018,
                              help='B-spline corner smoothing')
     eval_parser.add_argument('--max_steps', type=int, default=3000,
                              help='Maximum simulation steps')

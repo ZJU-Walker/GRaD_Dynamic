@@ -23,6 +23,9 @@ from controller.nav_helpers import (
     get_path,
     generate_bspline_trajectory_from_path,
     render_and_save,
+    save_trajectory_3d_plot,
+    save_trajectory_topdown,
+    save_trajectory_profile,
 )
 from models.vel_net import VELO_NET
 from models.vel_net.visual_encoder import DualEncoder
@@ -69,6 +72,8 @@ PC_TO_SIM_OFFSET = np.array([6.0, 0.0, 0.0])
 def fly_and_evaluate(
     model: VELO_NET,
     encoder: DualEncoder,
+    vel_mean: torch.Tensor,
+    vel_std: torch.Tensor,
     map_name: str = 'gate_mid',
     v_avg: float = 1.0,
     output_dir: str = 'output/vel_net_eval',
@@ -82,6 +87,8 @@ def fly_and_evaluate(
     Args:
         model: Trained VELO_NET model
         encoder: Trained DualEncoder
+        vel_mean: Velocity mean for normalization (3,)
+        vel_std: Velocity std for normalization (3,)
         map_name: Map name
         v_avg: Average velocity (m/s)
         output_dir: Output directory for video and plots
@@ -94,6 +101,9 @@ def fly_and_evaluate(
     """
     model.eval()
     encoder.eval()
+
+    vel_mean = vel_mean.to(device)
+    vel_std = vel_std.to(device)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +143,29 @@ def fly_and_evaluate(
         corner_smoothing=smoothing,
     )
 
+    # Save planning plots BEFORE flying
+    full_waypoints_pc = [start_pos_pc] + waypoints_pc + [destination_pc]
+    try:
+        save_trajectory_topdown(
+            sampler=sampler,
+            astar_path=path_pc,
+            waypoints=full_waypoints_pc,
+            output_path=str(output_dir / f'eval_{map_name}_astar_bspline.png'),
+            pc_offset=PC_TO_SIM_OFFSET,
+        )
+        print(f"Saved: {output_dir}/eval_{map_name}_astar_bspline.png")
+    except Exception as e:
+        print(f"Warning: Could not save astar_bspline plot: {e}")
+
+    try:
+        save_trajectory_profile(
+            sampler=sampler,
+            output_path=str(output_dir / f'eval_{map_name}_trajectory_profile.png'),
+        )
+        print(f"Saved: {output_dir}/eval_{map_name}_trajectory_profile.png")
+    except Exception as e:
+        print(f"Warning: Could not save trajectory_profile plot: {e}")
+
     # 2. Initialize environment
     print("Initializing environment...")
     env = SimpleDroneEnv(
@@ -140,7 +173,7 @@ def fly_and_evaluate(
         device=device,
         num_envs=1,
         episode_length=max_steps,
-        render_resolution=1.0,
+        render_resolution=0.4,  # Must match training data collection!
     )
     env.reset(start_position=start_pos_sim.tolist())
 
@@ -162,6 +195,8 @@ def fly_and_evaluate(
     vel_gt_list = []
     vel_pred_list = []
     timestamps = []
+    trajectory_actual = []
+    trajectory_desired = []
 
     dt = 1.0 / env.sim_freq  # Use env's sim frequency
     total_time = sampler.total_time + 2.0  # Extra hover time
@@ -169,9 +204,12 @@ def fly_and_evaluate(
     start_pos_d, _, _, _ = sampler.sample(0.0)
     stabilize_steps = 50
 
-    # Initialize prev_vel for auto-regressive inference
-    prev_vel = torch.zeros(1, 3, device=device)
+    # Initialize prev_vel for auto-regressive inference (normalized)
+    prev_vel_norm = (torch.zeros(1, 3, device=device) - vel_mean) / vel_std
     prev_action = torch.zeros(1, 4, device=device)
+
+    # Reset GRU hidden state for sequential processing
+    model.reset_hidden_state(batch_size=1)
 
     print(f"Flying trajectory ({sampler.total_time:.1f}s)...")
     pbar = tqdm(total=max_steps, desc='Flight', unit='step')
@@ -206,6 +244,11 @@ def fly_and_evaluate(
             vel_d = np.zeros(3)
             acc_d = np.zeros(3)
             yaw_d = 0.0
+
+        # Record trajectory (after stabilization)
+        if step >= stabilize_steps:
+            trajectory_actual.append(pos.copy())
+            trajectory_desired.append(np.array(pos_d).copy())
 
         thrust, omega_cmd, _ = controller.compute_from_quaternion(
             pos, vel_gt, quat_wxyz, omega,
@@ -255,17 +298,20 @@ def fly_and_evaluate(
                     rot6d,           # 6
                     action_tensor,   # 4
                     prev_action,     # 4
-                    prev_vel,        # 3
+                    prev_vel_norm,   # 3 (normalized)
                     rgb_feat,        # 32
                     depth_feat,      # 32
                 ], dim=1)
 
-                # Predict velocity
-                vel_mu, _ = model.encode(obs)
+                # Predict velocity (normalized output) - use encode_step for GRU state
+                vel_mu_norm, _ = model.encode_step(obs)
+
+                # Denormalize for metrics
+                vel_mu = vel_mu_norm * vel_std + vel_mean
                 vel_pred = vel_mu[0].cpu().numpy()
 
-                # Update prev_vel for next step (auto-regressive)
-                prev_vel = vel_mu.detach()
+                # Update prev_vel for next step (keep normalized)
+                prev_vel_norm = vel_mu_norm.detach()
 
             # Record data
             vel_gt_list.append(vel_gt.copy())
@@ -328,6 +374,21 @@ def fly_and_evaluate(
     render_and_save(frames, str(video_path), fps=25)
     print(f"Video saved: {video_path}")
 
+    # Save trajectory 3D plot (actual vs desired)
+    if len(trajectory_actual) > 0 and len(trajectory_desired) > 0:
+        waypoints_sim = [np.array(wp) + PC_TO_SIM_OFFSET for wp in full_waypoints_pc]
+        try:
+            traj_plot_path = output_dir / f'eval_{map_name}_trajectory.png'
+            save_trajectory_3d_plot(
+                trajectory_actual=trajectory_actual,
+                trajectory_desired=trajectory_desired,
+                waypoints=waypoints_sim,
+                output_path=str(traj_plot_path),
+            )
+            print(f"Trajectory plot saved: {traj_plot_path}")
+        except Exception as e:
+            print(f"Warning: Could not save trajectory plot: {e}")
+
     # Save velocity plot
     plot_path = output_dir / f'eval_{map_name}_v{v_avg}_velocity.png'
     save_velocity_plot(timestamps_arr, vel_gt_arr, vel_pred_arr, metrics, str(plot_path))
@@ -340,6 +401,8 @@ def fly_and_evaluate(
         timestamps=timestamps_arr,
         vel_gt=vel_gt_arr,
         vel_pred=vel_pred_arr,
+        trajectory_actual=np.array(trajectory_actual),
+        trajectory_desired=np.array(trajectory_desired),
         metrics=metrics,
     )
     print(f"Data saved: {data_path}")
