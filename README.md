@@ -102,7 +102,7 @@ Train the velocity network with curriculum learning:
       --batch_size 16 \
       --seq_length 32 --stride 16 \
       --tf_start_epoch 10 --tf_end_epoch 60 \
-      --wandb --checkpoint_dir checkpoints/vel_net_0106
+      --wandb --checkpoint_dir checkpoints/vel_net_0106_norm_v2
 ```
 
 **Options:**
@@ -112,10 +112,46 @@ Train the velocity network with curriculum learning:
 | `--epochs` | Maximum epochs | `500` |
 | `--batch_size` | Batch size | `64` |
 | `--lr` | Learning rate | `1e-4` |
+| `--seq_length` | Frames per sequence chunk | `32` |
+| `--stride` | Stride between chunks | `16` |
+| `--tf_start_epoch` | Epoch to start TF decay | `10` |
+| `--tf_end_epoch` | Epoch to end TF decay (0% GT after) | `60` |
 | `--wandb` | Enable wandb logging | off |
 | `--checkpoint_dir` | Checkpoint directory | `checkpoints/vel_net` |
 | `--resume` | Resume from checkpoint | None |
 
+**Training Output Explained:**
+```
+Epoch   3 | TF=1.00 | Loss=0.8234 | AR_MAE=0.1542 | LR=1.0e-04
+```
+
+| Metric | Meaning |
+|--------|---------|
+| **Epoch** | Current training iteration |
+| **TF** | Teacher Forcing ratio - % of GT prev_vel used (1.0=100% GT, 0.0=100% predicted) |
+| **Loss** | Training MSE on normalized velocities (all axes scaled to ~same range) |
+| **AR_MAE** | Auto-Regressive MAE on validation set in **m/s** (real-world units, most important!) |
+| **LR** | Current learning rate |
+
+**Teacher Forcing Schedule:**
+```
+--tf_start_epoch 10 --tf_end_epoch 60
+
+Epoch:    0         10        35        60        500
+          |---------|---------|---------|---------|
+TF:       1.0       1.0       0.5       0.0       0.0
+          ^^^^^^^^^ ^^^^^^^^^ ^^^^^^^^^ ^^^^^^^^^
+          100% GT   Start     Decaying  0% GT
+          (easy)    decay               (realistic)
+```
+
+**What gets saved:**
+- `best.pt` - Saved when **AR_MAE improves** (best validation performance)
+- `epoch_N.pt` - Periodic checkpoints every 50 epochs
+- `final.pt` - Final model after training
+
+**Velocity Normalization:**
+Training uses z-score normalization so all axes (vx, vy, vz) contribute equally to the loss. The normalization stats (`vel_mean`, `vel_std`) are saved in the checkpoint for inference.
 
 ### 3. Evaluation
 
