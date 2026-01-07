@@ -100,6 +100,38 @@ class CompactEncoder(nn.Module):
 
         return output
 
+    def extract_backbone_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Extract features from frozen backbone only (before FC layer).
+
+        Args:
+            x: Input image (B, C, H, W)
+
+        Returns:
+            Backbone features (B, 576)
+        """
+        if x.max() > 1.0:
+            x = x / 255.0
+
+        with torch.no_grad():
+            features = self.features(x)
+            features = self.pool(features)
+            features = features.view(features.size(0), -1)  # (B, 576)
+
+        return features
+
+    def forward_from_backbone_features(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass from pre-computed backbone features (apply FC only).
+
+        Args:
+            features: Pre-computed backbone features (B, 576)
+
+        Returns:
+            Output features (B, output_dim)
+        """
+        return self.fc(features)
+
     def get_trainable_params(self):
         """Return only trainable parameters (FC layer)."""
         return self.fc.parameters()
@@ -172,6 +204,43 @@ class DualEncoder(nn.Module):
         elif depth.dim() == 4 and depth.shape[-1] == 1:
             depth = depth.permute(0, 3, 1, 2)
         return self.depth_encoder(depth)
+
+    def extract_backbone_features(self, rgb: torch.Tensor, depth: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extract backbone features from both encoders (before FC layers).
+
+        Args:
+            rgb: RGB image (B, 3, H, W)
+            depth: Depth image (B, 1, H, W)
+
+        Returns:
+            Tuple of (rgb_backbone_features, depth_backbone_features), each (B, 576)
+        """
+        if rgb.dim() == 4 and rgb.shape[-1] == 3:
+            rgb = rgb.permute(0, 3, 1, 2)
+        if depth.dim() == 3:
+            depth = depth.unsqueeze(1)
+        elif depth.dim() == 4 and depth.shape[-1] == 1:
+            depth = depth.permute(0, 3, 1, 2)
+
+        rgb_feat = self.rgb_encoder.extract_backbone_features(rgb)
+        depth_feat = self.depth_encoder.extract_backbone_features(depth)
+        return rgb_feat, depth_feat
+
+    def forward_from_backbone_features(self, rgb_feat: torch.Tensor, depth_feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass from pre-computed backbone features (apply FC only).
+
+        Args:
+            rgb_feat: Pre-computed RGB backbone features (B, 576)
+            depth_feat: Pre-computed depth backbone features (B, 576)
+
+        Returns:
+            Tuple of (rgb_features, depth_features), each (B, output_dim)
+        """
+        rgb_out = self.rgb_encoder.forward_from_backbone_features(rgb_feat)
+        depth_out = self.depth_encoder.forward_from_backbone_features(depth_feat)
+        return rgb_out, depth_out
 
     def get_trainable_params(self):
         """Return trainable parameters from both encoders."""
