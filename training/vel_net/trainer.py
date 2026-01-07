@@ -1,18 +1,20 @@
 """
-Velocity Network Trainer with Curriculum Learning.
+Velocity Network Trainer with Scheduled Sampling.
+
+Scheduled sampling gradually transitions from teacher forcing (using GT prev_vel)
+to auto-regressive inference (using predicted prev_vel). This prevents the model
+from learning the "copying shortcut" where it just outputs prev_vel.
 
 Training stages:
-- Stage A (Imitation): Pure supervised loss (MSE)
-- Stage B (PINN): Supervised + Physics-Informed loss
-
-Auto-regressive validation: Test with predicted prev_vel fed back.
+- Start: 100% teacher forcing (use GT prev_vel)
+- Decay: Linearly decrease teacher forcing ratio over N epochs
+- End: 0% teacher forcing (use predicted prev_vel)
 """
 
 import os
 import sys
 from pathlib import Path
 
-# Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 import torch
@@ -21,12 +23,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from typing import Optional, Dict, Tuple, List
 import numpy as np
-import time
+from tqdm import tqdm
 
 from models.vel_net import VELO_NET
 from models.vel_net.visual_encoder import DualEncoder
 
-# Optional wandb
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -36,12 +37,15 @@ except ImportError:
 
 class VelNetTrainer:
     """
-    Trainer for velocity network with curriculum learning.
+    Trainer with scheduled sampling for velocity network.
 
-    Stage A: Pure supervised learning (MSE loss)
-    Stage B: Supervised + PINN loss
+    Key features:
+    - Processes sequences step-by-step (not batched single frames)
+    - Gradually replaces GT prev_vel with predicted prev_vel
+    - teacher_forcing_ratio decays from 1.0 to target over epochs
+    - Auto-regressive validation (0% teacher forcing)
 
-    The encoder's FC layer is trainable and learns jointly with vel_net.
+    This breaks the "copying shortcut" where model just outputs prev_vel.
     """
 
     def __init__(
@@ -53,9 +57,8 @@ class VelNetTrainer:
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         grad_clip: float = 1.0,
-        pinn_weight: float = 0.1,
-        stage_patience: int = 20,
-        early_stop_patience: int = 30,
+        tf_start_epoch: int = 0,
+        tf_end_epoch: int = 100,
         device: str = 'cuda:0',
         checkpoint_dir: str = 'checkpoints/vel_net',
         use_wandb: bool = False,
@@ -67,17 +70,16 @@ class VelNetTrainer:
         Args:
             model: VELO_NET model
             encoder: DualEncoder for visual features
-            train_loader: Training dataloader
-            val_loader: Validation dataloader
+            train_loader: Sequence-based training dataloader
+            val_loader: Sequence-based validation dataloader
             lr: Learning rate
-            weight_decay: Weight decay for optimizer
-            grad_clip: Gradient clipping value
-            pinn_weight: Weight for physics loss in Stage B
-            stage_patience: Epochs before transitioning A->B
-            early_stop_patience: Epochs for early stopping in Stage B
+            weight_decay: Weight decay
+            grad_clip: Gradient clipping
+            tf_start_epoch: Epoch to start decaying (before = 100% GT)
+            tf_end_epoch: Epoch to finish decaying (after = 0% GT, use predicted)
             device: PyTorch device
-            checkpoint_dir: Directory for checkpoints
-            use_wandb: Whether to use wandb logging
+            checkpoint_dir: Checkpoint directory
+            use_wandb: Enable wandb logging
             wandb_project: Wandb project name
         """
         self.model = model.to(device)
@@ -88,33 +90,28 @@ class VelNetTrainer:
 
         self.lr = lr
         self.grad_clip = grad_clip
-        self.pinn_weight = pinn_weight
-        self.stage_patience = stage_patience
-        self.early_stop_patience = early_stop_patience
+        self.tf_start_epoch = tf_start_epoch
+        self.tf_end_epoch = tf_end_epoch
 
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Optimizer: Include both model and encoder FC layer params
+        # Optimizer
         self.optimizer = torch.optim.AdamW(
             list(model.parameters()) + list(encoder.get_trainable_params()),
             lr=lr,
             weight_decay=weight_decay,
         )
 
-        # Learning rate scheduler
+        # Scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=10,
-            min_lr=1e-6,
+            self.optimizer, mode='min', factor=0.5, patience=15, min_lr=1e-6,
         )
 
         # Training state
-        self.current_stage = 'A'  # Start with supervised only
         self.epoch = 0
         self.best_val_loss = float('inf')
+        self.best_ar_mae = float('inf')
         self.epochs_without_improvement = 0
 
         # Wandb
@@ -125,251 +122,317 @@ class VelNetTrainer:
                 config={
                     'lr': lr,
                     'weight_decay': weight_decay,
-                    'grad_clip': grad_clip,
-                    'pinn_weight': pinn_weight,
-                    'stage_patience': stage_patience,
-                    'early_stop_patience': early_stop_patience,
+                    'tf_start_epoch': tf_start_epoch,
+                    'tf_end_epoch': tf_end_epoch,
                     'model_params': sum(p.numel() for p in model.parameters()),
-                    'encoder_trainable_params': encoder.num_trainable_params(),
                 },
             )
 
-    def train_epoch(self) -> Dict[str, float]:
+    def get_teacher_forcing_ratio(self) -> float:
         """
-        Train for one epoch.
+        Get current teacher forcing ratio based on epoch.
 
-        Returns:
-            Dict with training metrics
+        - Before tf_start_epoch: 1.0 (100% GT)
+        - Between tf_start_epoch and tf_end_epoch: linear decay
+        - After tf_end_epoch: 0.0 (0% GT, use predicted)
         """
+        if self.epoch < self.tf_start_epoch:
+            return 1.0  # 100% GT
+        if self.epoch >= self.tf_end_epoch:
+            return 0.0  # 0% GT (use predicted)
+
+        # Linear decay between start and end
+        progress = (self.epoch - self.tf_start_epoch) / (self.tf_end_epoch - self.tf_start_epoch)
+        return 1.0 - progress  # 1.0 -> 0.0
+
+    def _load_images_for_frame(self, seq_path: str, frame_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load RGB and depth images for a single frame."""
+        from PIL import Image
+
+        seq_path = Path(seq_path)
+        rgb_path = seq_path / "rgb" / f"{frame_idx:06d}.png"
+        depth_path = seq_path / "depth" / f"{frame_idx:06d}.npy"
+
+        rgb = np.array(Image.open(rgb_path)).astype(np.float32) / 255.0
+        depth = np.load(depth_path).astype(np.float32).squeeze()
+
+        rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1)
+        depth_tensor = torch.from_numpy(depth).unsqueeze(0)
+
+        return rgb_tensor, depth_tensor
+
+    def _load_backbone_features(self, seq_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Load precomputed backbone features for a sequence (cached)."""
+        if not hasattr(self, '_feature_cache'):
+            self._feature_cache = {}
+
+        if seq_path not in self._feature_cache:
+            feature_path = Path(seq_path) / "backbone_features.npz"
+            features = np.load(feature_path)
+            self._feature_cache[seq_path] = (features['rgb_features'], features['depth_features'])
+
+        return self._feature_cache[seq_path]
+
+    def _check_precomputed_available(self) -> bool:
+        """Check if precomputed features exist."""
+        for batch in self.train_loader:
+            for seq_path in batch['seq_paths']:
+                if not (Path(seq_path) / "backbone_features.npz").exists():
+                    return False
+            break
+        return True
+
+    def train_epoch(self, pbar: tqdm = None) -> Dict[str, float]:
+        """Train for one epoch with scheduled sampling (uses precomputed features)."""
+        from models.vel_net.vel_obs_utils import quaternion_to_rot6d
+
         self.model.train()
         self.encoder.train()
 
+        tf_ratio = self.get_teacher_forcing_ratio()
+
         total_loss = 0.0
-        total_mse_loss = 0.0
-        total_pinn_loss = 0.0
-        n_batches = 0
+        total_tf_frames = 0
+        total_pred_frames = 0
+        n_sequences = 0
 
         for batch in self.train_loader:
-            obs = batch['observation'].to(self.device)  # (B, 81)
-            vel_gt = batch['velocity_gt'].to(self.device)  # (B, 3)
+            batch_loss = 0.0
+            batch_frames = 0
 
-            self.optimizer.zero_grad()
+            for b_idx in range(len(batch['seq_paths'])):
+                seq_path = batch['seq_paths'][b_idx]
+                frame_indices = batch['frame_indices'][b_idx]
+                orientations = batch['orientations'][b_idx].to(self.device)
+                actions = batch['actions'][b_idx].to(self.device)
+                prev_actions = batch['prev_actions'][b_idx].to(self.device)
+                velocities_gt = batch['velocities_gt'][b_idx].to(self.device)
+                prev_vel = batch['initial_prev_vels'][b_idx].to(self.device)
 
-            # Forward pass
-            estimation, latent_params = self.model.forward(obs)
-            vel_pred = estimation[0]  # (B, 3)
+                # Load precomputed backbone features for this sequence
+                rgb_backbone, depth_backbone = self._load_backbone_features(seq_path)
 
-            # MSE loss
-            mse_loss = F.mse_loss(vel_pred, vel_gt)
+                seq_length = len(frame_indices)
+                self.model.reset_hidden_state(batch_size=1)
 
-            # PINN loss (Stage B only)
-            if self.current_stage == 'B':
-                # Simplified physics loss for single-frame input
-                # For full PINN, would need sequence data
-                pinn_loss = torch.tensor(0.0, device=self.device)
-                loss = mse_loss + self.pinn_weight * pinn_loss
-            else:
-                pinn_loss = torch.tensor(0.0, device=self.device)
-                loss = mse_loss
+                for t in range(seq_length):
+                    frame_idx = frame_indices[t]
 
-            # Backward pass
-            loss.backward()
+                    # Get precomputed 576-dim backbone features
+                    rgb_bb = torch.from_numpy(rgb_backbone[frame_idx:frame_idx+1]).to(self.device)
+                    depth_bb = torch.from_numpy(depth_backbone[frame_idx:frame_idx+1]).to(self.device)
 
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                list(self.model.parameters()) + list(self.encoder.get_trainable_params()),
-                self.grad_clip
-            )
+                    # Apply trainable FC layer only (576 -> 32)
+                    rgb_feat, depth_feat = self.encoder.forward_from_backbone_features(rgb_bb, depth_bb)
 
-            self.optimizer.step()
+                    quat = orientations[t:t+1]
+                    rot6d = quaternion_to_rot6d(quat)
+                    action = actions[t:t+1]
+                    prev_action = prev_actions[t:t+1]
 
-            # Accumulate metrics
-            total_loss += loss.item()
-            total_mse_loss += mse_loss.item()
-            total_pinn_loss += pinn_loss.item()
-            n_batches += 1
+                    obs = torch.cat([
+                        rot6d, action, prev_action,
+                        prev_vel.unsqueeze(0),
+                        rgb_feat, depth_feat,
+                    ], dim=1)
 
-        metrics = {
+                    vel_mu, _ = self.model.encode_step(obs)
+
+                    vel_gt = velocities_gt[t:t+1]
+                    loss = F.mse_loss(vel_mu, vel_gt)
+                    batch_loss += loss
+                    batch_frames += 1
+
+                    # Scheduled sampling: choose GT or predicted prev_vel
+                    if np.random.random() < tf_ratio:
+                        prev_vel = vel_gt.squeeze(0).detach()
+                        total_tf_frames += 1
+                    else:
+                        prev_vel = vel_mu.squeeze(0).detach()
+                        total_pred_frames += 1
+
+                n_sequences += 1
+
+            if batch_frames > 0:
+                avg_loss = batch_loss / batch_frames
+                self.optimizer.zero_grad()
+                avg_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.model.parameters()) + list(self.encoder.get_trainable_params()),
+                    self.grad_clip
+                )
+                self.optimizer.step()
+                total_loss += avg_loss.item()
+
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix({
+                    'loss': f'{total_loss / max(1, n_sequences // len(batch["seq_paths"])):.4f}',
+                    'tf': f'{tf_ratio:.2f}',
+                })
+
+        n_batches = len(self.train_loader)
+        total_frames = total_tf_frames + total_pred_frames
+        actual_tf_ratio = total_tf_frames / max(1, total_frames)
+
+        return {
             'train/loss': total_loss / n_batches,
-            'train/mse_loss': total_mse_loss / n_batches,
-            'train/pinn_loss': total_pinn_loss / n_batches,
-            'train/stage': 0 if self.current_stage == 'A' else 1,
+            'train/tf_ratio_target': tf_ratio,
+            'train/tf_ratio_actual': actual_tf_ratio,
+            'train/tf_frames': total_tf_frames,
+            'train/pred_frames': total_pred_frames,
         }
 
-        return metrics
-
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
-        """
-        Validate on validation set.
+    def validate_autoregressive(self) -> Dict[str, float]:
+        """Validate using auto-regressive inference (0% teacher forcing, uses precomputed features)."""
+        from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 
-        Returns:
-            Dict with validation metrics
-        """
         self.model.eval()
         self.encoder.eval()
 
-        total_loss = 0.0
+        all_errors = []
         total_mse = 0.0
-        total_mae = 0.0
-        total_samples = 0
-
-        all_preds = []
-        all_gts = []
+        total_frames = 0
 
         for batch in self.val_loader:
-            obs = batch['observation'].to(self.device)
-            vel_gt = batch['velocity_gt'].to(self.device)
+            for b_idx in range(len(batch['seq_paths'])):
+                seq_path = batch['seq_paths'][b_idx]
+                frame_indices = batch['frame_indices'][b_idx]
+                orientations = batch['orientations'][b_idx].to(self.device)
+                actions = batch['actions'][b_idx].to(self.device)
+                prev_actions = batch['prev_actions'][b_idx].to(self.device)
+                velocities_gt = batch['velocities_gt'][b_idx].to(self.device)
+                prev_vel = batch['initial_prev_vels'][b_idx].to(self.device)
 
-            # Forward pass (deterministic: use mu directly)
-            vel_mu, _ = self.model.encode(obs)
+                # Load precomputed backbone features for this sequence
+                rgb_backbone, depth_backbone = self._load_backbone_features(seq_path)
 
-            # Metrics
-            mse = F.mse_loss(vel_mu, vel_gt, reduction='none').mean(dim=1)
-            mae = torch.abs(vel_mu - vel_gt).mean(dim=1)
+                seq_length = len(frame_indices)
+                self.model.reset_hidden_state(batch_size=1)
 
-            total_loss += mse.sum().item()
-            total_mse += mse.sum().item()
-            total_mae += mae.sum().item()
-            total_samples += obs.size(0)
+                for t in range(seq_length):
+                    frame_idx = frame_indices[t]
 
-            all_preds.append(vel_mu.cpu())
-            all_gts.append(vel_gt.cpu())
+                    # Get precomputed 576-dim backbone features
+                    rgb_bb = torch.from_numpy(rgb_backbone[frame_idx:frame_idx+1]).to(self.device)
+                    depth_bb = torch.from_numpy(depth_backbone[frame_idx:frame_idx+1]).to(self.device)
 
-        # Compute metrics
-        avg_mse = total_mse / total_samples
-        avg_mae = total_mae / total_samples
-        avg_loss = total_loss / total_samples
+                    # Apply trainable FC layer only (576 -> 32)
+                    rgb_feat, depth_feat = self.encoder.forward_from_backbone_features(rgb_bb, depth_bb)
 
-        # Per-axis errors
-        all_preds = torch.cat(all_preds, dim=0)
-        all_gts = torch.cat(all_gts, dim=0)
-        per_axis_mae = torch.abs(all_preds - all_gts).mean(dim=0)
+                    quat = orientations[t:t+1]
+                    rot6d = quaternion_to_rot6d(quat)
+                    action = actions[t:t+1]
+                    prev_action = prev_actions[t:t+1]
 
-        metrics = {
-            'val/loss': avg_loss,
-            'val/mse': avg_mse,
-            'val/rmse': np.sqrt(avg_mse),
-            'val/mae': avg_mae,
-            'val/mae_x': per_axis_mae[0].item(),
-            'val/mae_y': per_axis_mae[1].item(),
-            'val/mae_z': per_axis_mae[2].item(),
+                    obs = torch.cat([
+                        rot6d, action, prev_action,
+                        prev_vel.unsqueeze(0),
+                        rgb_feat, depth_feat,
+                    ], dim=1)
+
+                    vel_mu, _ = self.model.encode_step(obs)
+                    vel_gt = velocities_gt[t:t+1]
+
+                    error = torch.abs(vel_mu - vel_gt).cpu().numpy()[0]
+                    all_errors.append(error)
+                    total_mse += F.mse_loss(vel_mu, vel_gt).item()
+                    total_frames += 1
+
+                    # Always use predicted for auto-regressive validation
+                    prev_vel = vel_mu.squeeze(0)
+
+        all_errors = np.array(all_errors)
+        mae = np.mean(all_errors)
+        mae_xyz = np.mean(all_errors, axis=0)
+
+        return {
+            'val/ar_mse': total_mse / max(1, total_frames),
+            'val/ar_mae': mae,
+            'val/ar_mae_x': mae_xyz[0],
+            'val/ar_mae_y': mae_xyz[1],
+            'val/ar_mae_z': mae_xyz[2],
+            'val/ar_rmse': np.sqrt(total_mse / max(1, total_frames)),
         }
 
-        return metrics
+    def train(self, n_epochs: int = 200, early_stop_patience: int = 30) -> Dict[str, List[float]]:
+        """Main training loop with scheduled sampling."""
+        history = {
+            'train_loss': [],
+            'val_ar_mae': [],
+            'tf_ratio': [],
+        }
 
-    def check_stage_transition(self, val_loss: float):
-        """
-        Check if should transition from Stage A to Stage B.
+        # Check for precomputed features
+        if not self._check_precomputed_available():
+            raise RuntimeError(
+                "Precomputed backbone features not found!\n"
+                "Run first: python training/vel_net/precompute_features.py "
+                f"--data_dir <your_data_dir>"
+            )
 
-        Args:
-            val_loss: Current validation loss
-        """
-        if self.current_stage == 'A':
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
+        print(f"\n{'='*60}")
+        print(f"Velocity Network Training (Scheduled Sampling)")
+        print(f"{'='*60}")
+        print(f"  Model params: {sum(p.numel() for p in self.model.parameters()):,}")
+        print(f"  Encoder trainable: {self.encoder.num_trainable_params():,}")
+        print(f"  TF schedule: 100% GT (epoch 0-{self.tf_start_epoch}) -> decay -> 0% GT (epoch {self.tf_end_epoch}+)")
+        print(f"  Using precomputed backbone features (fast mode)")
+        print(f"{'='*60}\n")
+
+        n_batches = len(self.train_loader)
+
+        for epoch in range(n_epochs):
+            self.epoch = epoch
+            tf_ratio = self.get_teacher_forcing_ratio()
+
+            batch_pbar = tqdm(
+                total=n_batches,
+                desc=f'Epoch {epoch:3d} [TF={tf_ratio:.2f}]',
+                leave=False,
+            )
+            train_metrics = self.train_epoch(pbar=batch_pbar)
+            batch_pbar.close()
+
+            val_metrics = self.validate_autoregressive()
+            self.scheduler.step(val_metrics['val/ar_mae'])
+
+            if val_metrics['val/ar_mae'] < self.best_ar_mae:
+                self.best_ar_mae = val_metrics['val/ar_mae']
                 self.epochs_without_improvement = 0
-            else:
-                self.epochs_without_improvement += 1
-
-            if self.epochs_without_improvement >= self.stage_patience:
-                print(f"\n[Trainer] Transitioning to Stage B (PINN) after {self.epoch} epochs")
-                self.current_stage = 'B'
-                self.epochs_without_improvement = 0
-                self.best_val_loss = float('inf')  # Reset for Stage B
-
-        elif self.current_stage == 'B':
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
-                self.epochs_without_improvement = 0
-                # Save best model
                 self.save_checkpoint('best.pt')
             else:
                 self.epochs_without_improvement += 1
 
-    def should_stop(self) -> bool:
-        """Check if training should stop early."""
-        if self.current_stage == 'B':
-            return self.epochs_without_improvement >= self.early_stop_patience
-        return False
-
-    def train(self, n_epochs: int = 500) -> Dict[str, List[float]]:
-        """
-        Main training loop.
-
-        Args:
-            n_epochs: Maximum number of epochs
-
-        Returns:
-            Dict with training history
-        """
-        history = {
-            'train_loss': [],
-            'val_loss': [],
-            'val_mae': [],
-        }
-
-        print(f"\n{'='*60}")
-        print(f"Starting Training")
-        print(f"{'='*60}")
-        print(f"  Model params: {sum(p.numel() for p in self.model.parameters()):,}")
-        print(f"  Encoder trainable params: {self.encoder.num_trainable_params():,}")
-        print(f"  Train samples: {len(self.train_loader.dataset)}")
-        print(f"  Val samples: {len(self.val_loader.dataset)}")
-        print(f"{'='*60}\n")
-
-        for epoch in range(n_epochs):
-            self.epoch = epoch
-            start_time = time.time()
-
-            # Train
-            train_metrics = self.train_epoch()
-
-            # Validate
-            val_metrics = self.validate()
-
-            # Update scheduler
-            self.scheduler.step(val_metrics['val/loss'])
-
-            # Check stage transition
-            self.check_stage_transition(val_metrics['val/loss'])
-
-            # Record history
             history['train_loss'].append(train_metrics['train/loss'])
-            history['val_loss'].append(val_metrics['val/loss'])
-            history['val_mae'].append(val_metrics['val/mae'])
+            history['val_ar_mae'].append(val_metrics['val/ar_mae'])
+            history['tf_ratio'].append(tf_ratio)
 
-            # Log to wandb
             if self.use_wandb:
                 metrics = {**train_metrics, **val_metrics}
                 metrics['epoch'] = epoch
                 metrics['lr'] = self.optimizer.param_groups[0]['lr']
                 wandb.log(metrics)
 
-            # Print progress
-            elapsed = time.time() - start_time
-            print(f"Epoch {epoch:3d} [{self.current_stage}] | "
-                  f"Loss: {train_metrics['train/loss']:.4f} | "
-                  f"Val MSE: {val_metrics['val/mse']:.4f} | "
-                  f"Val MAE: {val_metrics['val/mae']:.4f} | "
-                  f"LR: {self.optimizer.param_groups[0]['lr']:.2e} | "
-                  f"{elapsed:.1f}s")
+            print(f"Epoch {epoch:3d} | TF={tf_ratio:.2f} | "
+                  f"Loss={train_metrics['train/loss']:.4f} | "
+                  f"AR_MAE={val_metrics['val/ar_mae']:.4f} | "
+                  f"LR={self.optimizer.param_groups[0]['lr']:.1e}")
 
-            # Early stopping check
-            if self.should_stop():
+            if self.epochs_without_improvement >= early_stop_patience:
                 print(f"\nEarly stopping at epoch {epoch}")
                 break
 
-            # Periodic checkpoint
             if epoch % 50 == 0 and epoch > 0:
                 self.save_checkpoint(f'epoch_{epoch}.pt')
 
-        # Final save
         self.save_checkpoint('final.pt')
 
         if self.use_wandb:
             wandb.finish()
 
+        print(f"\nTraining complete! Best AR_MAE: {self.best_ar_mae:.4f}")
         return history
 
     def save_checkpoint(self, filename: str):
@@ -377,12 +440,13 @@ class VelNetTrainer:
         path = self.checkpoint_dir / filename
         checkpoint = {
             'epoch': self.epoch,
-            'stage': self.current_stage,
             'model_state_dict': self.model.state_dict(),
             'encoder_state_dict': self.encoder.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_val_loss': self.best_val_loss,
+            'best_ar_mae': self.best_ar_mae,
+            'tf_start_epoch': self.tf_start_epoch,
+            'tf_end_epoch': self.tf_end_epoch,
             'model_config': {
                 'num_obs': self.model.num_obs,
                 'stack_size': self.model.stack_size,
@@ -391,7 +455,7 @@ class VelNetTrainer:
             },
         }
         torch.save(checkpoint, path)
-        print(f"  Saved checkpoint: {path}")
+        print(f"  Saved: {path}")
 
     def load_checkpoint(self, path: str):
         """Load checkpoint."""
@@ -401,9 +465,8 @@ class VelNetTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         self.epoch = checkpoint['epoch']
-        self.current_stage = checkpoint['stage']
-        self.best_val_loss = checkpoint['best_val_loss']
-        print(f"Loaded checkpoint from {path} (epoch {self.epoch}, stage {self.current_stage})")
+        self.best_ar_mae = checkpoint.get('best_ar_mae', float('inf'))
+        print(f"Loaded checkpoint from {path} (epoch {self.epoch})")
 
 
 def autoregressive_test(
@@ -412,21 +475,13 @@ def autoregressive_test(
     test_sequence_path: str,
     device: str = 'cuda:0',
     max_steps: int = 300,
+    save_plot: bool = True,
+    plot_path: str = None,
 ) -> Dict[str, float]:
     """
     Test model with auto-regressive inference.
 
     Feeds predicted velocity back as prev_vel input.
-
-    Args:
-        model: VELO_NET model
-        encoder: DualEncoder for visual features
-        test_sequence_path: Path to test sequence
-        device: PyTorch device
-        max_steps: Maximum steps to test
-
-    Returns:
-        Dict with test metrics
     """
     from PIL import Image
     from models.vel_net.vel_obs_utils import quaternion_to_rot6d
@@ -443,25 +498,21 @@ def autoregressive_test(
     all_gts = []
     errors = []
 
-    # Start with zero velocity
     prev_vel = torch.zeros(1, 3, device=device)
 
     with torch.no_grad():
         for t in range(1, n_frames):
-            # Load image
             rgb_path = seq_path / "rgb" / f"{t:06d}.png"
             depth_path = seq_path / "depth" / f"{t:06d}.npy"
 
             rgb = np.array(Image.open(rgb_path)).astype(np.float32) / 255.0
-            depth = np.load(depth_path).astype(np.float32)
+            depth = np.load(depth_path).astype(np.float32).squeeze()
 
             rgb_tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0).to(device)
             depth_tensor = torch.from_numpy(depth).unsqueeze(0).unsqueeze(0).to(device)
 
-            # Encode images
             rgb_feat, depth_feat = encoder(rgb_tensor, depth_tensor)
 
-            # Build observation
             quat = torch.from_numpy(telemetry['orientations'][t].astype(np.float32)).unsqueeze(0).to(device)
             rot6d = quaternion_to_rot6d(quat)
 
@@ -470,13 +521,9 @@ def autoregressive_test(
 
             obs = torch.cat([rot6d, action, prev_action, prev_vel, rgb_feat, depth_feat], dim=1)
 
-            # Predict
             vel_mu, _ = model.encode(obs)
-
-            # Update prev_vel for next step (AUTO-REGRESSIVE)
             prev_vel = vel_mu.detach()
 
-            # Record
             vel_gt = telemetry['velocities'][t]
             all_preds.append(vel_mu.cpu().numpy()[0])
             all_gts.append(vel_gt)
@@ -499,7 +546,50 @@ def autoregressive_test(
     print(f"  MAE: {metrics['ar/mae']:.4f} m/s")
     print(f"  MAE (x,y,z): [{metrics['ar/mae_x']:.4f}, {metrics['ar/mae_y']:.4f}, {metrics['ar/mae_z']:.4f}]")
     print(f"  RMSE: {metrics['ar/rmse']:.4f} m/s")
-    print(f"  Max Error: {metrics['ar/max_error']:.4f} m/s")
+
+    if save_plot:
+        import matplotlib.pyplot as plt
+
+        timestamps = telemetry['timestamps'][1:n_frames]
+        t_axis = timestamps - timestamps[0]
+
+        fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+
+        axes[0].plot(t_axis, all_gts[:, 0], 'b-', label='GT', linewidth=1.5)
+        axes[0].plot(t_axis, all_preds[:, 0], 'r--', label='Pred', linewidth=1.5)
+        axes[0].set_ylabel('Vel X (m/s)')
+        axes[0].legend(loc='upper right')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].set_title(f'Velocity Prediction (Auto-regressive) | MAE: {metrics["ar/mae"]:.4f} m/s')
+
+        axes[1].plot(t_axis, all_gts[:, 1], 'b-', label='GT', linewidth=1.5)
+        axes[1].plot(t_axis, all_preds[:, 1], 'r--', label='Pred', linewidth=1.5)
+        axes[1].set_ylabel('Vel Y (m/s)')
+        axes[1].legend(loc='upper right')
+        axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(t_axis, all_gts[:, 2], 'b-', label='GT', linewidth=1.5)
+        axes[2].plot(t_axis, all_preds[:, 2], 'r--', label='Pred', linewidth=1.5)
+        axes[2].set_ylabel('Vel Z (m/s)')
+        axes[2].legend(loc='upper right')
+        axes[2].grid(True, alpha=0.3)
+
+        vel_mag_gt = np.linalg.norm(all_gts, axis=1)
+        vel_mag_pred = np.linalg.norm(all_preds, axis=1)
+        axes[3].plot(t_axis, vel_mag_gt, 'b-', label='GT', linewidth=1.5)
+        axes[3].plot(t_axis, vel_mag_pred, 'r--', label='Pred', linewidth=1.5)
+        axes[3].set_ylabel('Vel Mag (m/s)')
+        axes[3].set_xlabel('Time (s)')
+        axes[3].legend(loc='upper right')
+        axes[3].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        if plot_path is None:
+            plot_path = seq_path / 'vel_prediction.png'
+        plt.savefig(plot_path, dpi=150)
+        plt.close()
+        print(f"  Plot saved: {plot_path}")
 
     return metrics
 
