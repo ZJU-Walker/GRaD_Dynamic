@@ -143,6 +143,8 @@ def train_command(args):
             test_sequence_path=test_seq,
             vel_mean=trainer.vel_mean,
             vel_std=trainer.vel_std,
+            delta_mean=trainer.delta_mean,
+            delta_std=trainer.delta_std,
             device=device,
         )
 
@@ -150,7 +152,7 @@ def train_command(args):
 
 
 def test_command(args):
-    """Run auto-regressive test."""
+    """Run auto-regressive test with RESIDUAL prediction."""
     from training.vel_net.trainer import autoregressive_test
 
     device = args.device
@@ -176,10 +178,19 @@ def test_command(args):
     print(f"Loaded checkpoint from {args.checkpoint}")
     print(f"  Epoch: {checkpoint['epoch']}")
 
-    # Load velocity normalization stats
+    # Load normalization stats
     vel_mean = checkpoint.get('vel_mean', torch.zeros(3))
     vel_std = checkpoint.get('vel_std', torch.ones(3))
-    print(f"  Velocity norm: mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
+    delta_mean = checkpoint.get('delta_mean', torch.zeros(3))
+    delta_std = checkpoint.get('delta_std', torch.ones(3))
+    residual_mode = checkpoint.get('residual_mode', False)
+
+    print(f"  Velocity norm (input): mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
+    if residual_mode:
+        print(f"  Delta norm (output):   mean={delta_mean.cpu().numpy()}, std={delta_std.cpu().numpy()}")
+        print(f"  Mode: RESIDUAL (vel_pred = prev_vel + delta)")
+    else:
+        print(f"  Mode: ABSOLUTE (legacy checkpoint)")
 
     # Run test
     metrics = autoregressive_test(
@@ -188,6 +199,8 @@ def test_command(args):
         test_sequence_path=args.test_seq,
         vel_mean=vel_mean,
         vel_std=vel_std,
+        delta_mean=delta_mean,
+        delta_std=delta_std,
         device=device,
         max_steps=args.max_steps,
         save_plot=True,
@@ -196,7 +209,7 @@ def test_command(args):
 
 
 def eval_command(args):
-    """Run evaluation flight with trained model."""
+    """Run evaluation flight with trained model (RESIDUAL prediction mode)."""
     from training.vel_net.evaluator import fly_and_evaluate
 
     device = args.device
@@ -222,10 +235,19 @@ def eval_command(args):
     print(f"Loaded checkpoint from {args.checkpoint}")
     print(f"  Epoch: {checkpoint['epoch']}")
 
-    # Load velocity normalization stats
+    # Load normalization stats
     vel_mean = checkpoint.get('vel_mean', torch.zeros(3))
     vel_std = checkpoint.get('vel_std', torch.ones(3))
-    print(f"  Velocity norm: mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
+    delta_mean = checkpoint.get('delta_mean', torch.zeros(3))
+    delta_std = checkpoint.get('delta_std', torch.ones(3))
+    residual_mode = checkpoint.get('residual_mode', False)
+
+    print(f"  Velocity norm (input): mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
+    if residual_mode:
+        print(f"  Delta norm (output):   mean={delta_mean.cpu().numpy()}, std={delta_std.cpu().numpy()}")
+        print(f"  Mode: RESIDUAL (vel_pred = prev_vel + delta)")
+    else:
+        print(f"  Mode: ABSOLUTE (legacy checkpoint)")
 
     # Run evaluation flight
     fly_and_evaluate(
@@ -233,6 +255,8 @@ def eval_command(args):
         encoder=encoder,
         vel_mean=vel_mean,
         vel_std=vel_std,
+        delta_mean=delta_mean,
+        delta_std=delta_std,
         map_name=args.map,
         v_avg=args.v_avg,
         output_dir=args.output_dir,

@@ -1,9 +1,17 @@
 """
-Velocity Network Trainer with Scheduled Sampling.
+Velocity Network Trainer with Scheduled Sampling and Residual Prediction.
 
 Scheduled sampling gradually transitions from teacher forcing (using GT prev_vel)
 to auto-regressive inference (using predicted prev_vel). This prevents the model
 from learning the "copying shortcut" where it just outputs prev_vel.
+
+RESIDUAL PREDICTION MODE:
+Instead of predicting absolute velocity, the model predicts velocity CHANGE (delta):
+    vel_pred = prev_vel + model(obs)
+This fixes the systematic vx underestimation bias by:
+- Centering the output around 0 (delta mean ≈ 0)
+- Smaller output range (delta std ≈ 0.003 vs velocity std ≈ 0.19)
+- Model defaults to "maintain current velocity" instead of "regress to training mean"
 
 Training stages:
 - Start: 100% teacher forcing (use GT prev_vel)
@@ -114,9 +122,12 @@ class VelNetTrainer:
         self.best_ar_mae = float('inf')
         self.epochs_without_improvement = 0
 
-        # Compute velocity normalization stats from training data
-        self.vel_mean, self.vel_std = self._compute_velocity_stats()
-        print(f"  Velocity normalization: mean={self.vel_mean}, std={self.vel_std}")
+        # Compute normalization stats from training data
+        # vel_mean/std: for normalizing prev_vel INPUT to the model
+        # delta_mean/std: for normalizing the delta OUTPUT (target)
+        self.vel_mean, self.vel_std, self.delta_mean, self.delta_std = self._compute_velocity_stats()
+        print(f"  Velocity normalization (input): mean={self.vel_mean.cpu().numpy()}, std={self.vel_std.cpu().numpy()}")
+        print(f"  Delta normalization (output):   mean={self.delta_mean.cpu().numpy()}, std={self.delta_std.cpu().numpy()}")
 
         # Wandb
         self.use_wandb = use_wandb and WANDB_AVAILABLE
@@ -132,28 +143,61 @@ class VelNetTrainer:
                 },
             )
 
-    def _compute_velocity_stats(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute velocity mean and std from training data for normalization."""
-        all_vels = []
-        for batch in self.train_loader:
-            for vel_gt in batch['velocities_gt']:
-                all_vels.append(vel_gt.numpy())
-        all_vels = np.concatenate(all_vels, axis=0)
+    def _compute_velocity_stats(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute velocity and delta statistics from training data for normalization.
 
+        Returns:
+            vel_mean, vel_std: For normalizing prev_vel INPUT
+            delta_mean, delta_std: For normalizing delta OUTPUT (target)
+        """
+        all_vels = []
+        all_deltas = []
+
+        for batch in self.train_loader:
+            for b_idx in range(len(batch['velocities_gt'])):
+                vel_gt = batch['velocities_gt'][b_idx].numpy()
+                prev_vel = batch['initial_prev_vels'][b_idx].numpy()
+
+                all_vels.append(vel_gt)
+
+                # Compute delta: vel_gt[t] - prev_vel[t] for each timestep
+                # For first frame, delta = vel_gt[0] - initial_prev_vel
+                # For subsequent frames, delta = vel_gt[t] - vel_gt[t-1]
+                deltas = np.zeros_like(vel_gt)
+                deltas[0] = vel_gt[0] - prev_vel  # First frame delta
+                deltas[1:] = vel_gt[1:] - vel_gt[:-1]  # Subsequent frame deltas
+                all_deltas.append(deltas)
+
+        all_vels = np.concatenate(all_vels, axis=0)
+        all_deltas = np.concatenate(all_deltas, axis=0)
+
+        # Velocity stats (for input normalization)
         vel_mean = torch.from_numpy(all_vels.mean(axis=0).astype(np.float32)).to(self.device)
         vel_std = torch.from_numpy(all_vels.std(axis=0).astype(np.float32)).to(self.device)
-        # Prevent division by zero
         vel_std = torch.clamp(vel_std, min=1e-6)
 
-        return vel_mean, vel_std
+        # Delta stats (for output normalization)
+        delta_mean = torch.from_numpy(all_deltas.mean(axis=0).astype(np.float32)).to(self.device)
+        delta_std = torch.from_numpy(all_deltas.std(axis=0).astype(np.float32)).to(self.device)
+        delta_std = torch.clamp(delta_std, min=1e-6)
+
+        return vel_mean, vel_std, delta_mean, delta_std
 
     def normalize_velocity(self, vel: torch.Tensor) -> torch.Tensor:
-        """Normalize velocity to zero-mean, unit-variance."""
+        """Normalize velocity to zero-mean, unit-variance (for input)."""
         return (vel - self.vel_mean) / self.vel_std
 
     def denormalize_velocity(self, vel_norm: torch.Tensor) -> torch.Tensor:
         """Denormalize velocity back to original scale."""
         return vel_norm * self.vel_std + self.vel_mean
+
+    def normalize_delta(self, delta: torch.Tensor) -> torch.Tensor:
+        """Normalize delta (velocity change) to zero-mean, unit-variance."""
+        return (delta - self.delta_mean) / self.delta_std
+
+    def denormalize_delta(self, delta_norm: torch.Tensor) -> torch.Tensor:
+        """Denormalize delta back to original scale (m/s)."""
+        return delta_norm * self.delta_std + self.delta_mean
 
     def get_teacher_forcing_ratio(self) -> float:
         """
@@ -213,7 +257,12 @@ class VelNetTrainer:
         return True
 
     def train_epoch(self, pbar: tqdm = None) -> Dict[str, float]:
-        """Train for one epoch with scheduled sampling (uses precomputed features + AMP)."""
+        """Train for one epoch with scheduled sampling and RESIDUAL prediction.
+
+        RESIDUAL MODE: Model outputs delta (velocity change), not absolute velocity.
+        vel_pred = prev_vel + delta_pred
+        Loss is computed on normalized delta.
+        """
         from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 
         self.model.train()
@@ -222,6 +271,7 @@ class VelNetTrainer:
         tf_ratio = self.get_teacher_forcing_ratio()
 
         total_loss = 0.0
+        total_vel_error = 0.0  # Track reconstructed velocity error for monitoring
         total_tf_frames = 0
         total_pred_frames = 0
         n_sequences = 0
@@ -231,6 +281,7 @@ class VelNetTrainer:
 
         for batch in self.train_loader:
             batch_loss = 0.0
+            batch_vel_error = 0.0
             batch_frames = 0
 
             with torch.cuda.amp.autocast():
@@ -240,12 +291,13 @@ class VelNetTrainer:
                     orientations = batch['orientations'][b_idx].to(self.device)
                     actions = batch['actions'][b_idx].to(self.device)
                     prev_actions = batch['prev_actions'][b_idx].to(self.device)
-                    velocities_gt_raw = batch['velocities_gt'][b_idx].to(self.device)
-                    prev_vel_raw = batch['initial_prev_vels'][b_idx].to(self.device)
+                    velocities_gt_raw = batch['velocities_gt'][b_idx].to(self.device)  # Raw GT (m/s)
+                    prev_vel_raw = batch['initial_prev_vels'][b_idx].to(self.device)  # Raw (m/s)
 
-                    # Normalize velocities (zero-mean, unit-variance per axis)
-                    velocities_gt = self.normalize_velocity(velocities_gt_raw)
-                    prev_vel = self.normalize_velocity(prev_vel_raw)
+                    # For model INPUT: normalize prev_vel
+                    prev_vel_norm = self.normalize_velocity(prev_vel_raw)
+                    # Keep raw prev_vel for delta calculation
+                    prev_vel_raw_current = prev_vel_raw.clone()
 
                     # Load precomputed backbone features (already on GPU)
                     rgb_backbone, depth_backbone = self._load_backbone_features(seq_path)
@@ -268,24 +320,41 @@ class VelNetTrainer:
                             rot6d_all[t:t+1],
                             actions[t:t+1],
                             prev_actions[t:t+1],
-                            prev_vel.unsqueeze(0),
+                            prev_vel_norm.unsqueeze(0),  # Normalized prev_vel as input
                             rgb_feat_all[t:t+1],
                             depth_feat_all[t:t+1],
                         ], dim=1)
 
-                        vel_mu, _ = self.model.encode_step(obs)
+                        # Model outputs DELTA (normalized)
+                        delta_mu_norm, _ = self.model.encode_step(obs)
 
-                        vel_gt = velocities_gt[t:t+1]
-                        loss = F.mse_loss(vel_mu, vel_gt)
+                        # Compute GT delta (raw, then normalize)
+                        vel_gt_raw = velocities_gt_raw[t:t+1]
+                        delta_gt_raw = vel_gt_raw - prev_vel_raw_current.unsqueeze(0)
+                        delta_gt_norm = self.normalize_delta(delta_gt_raw)
+
+                        # Loss on normalized delta
+                        loss = F.mse_loss(delta_mu_norm, delta_gt_norm)
                         batch_loss += loss
                         batch_frames += 1
 
-                        # Scheduled sampling: choose GT or predicted prev_vel
+                        # Reconstruct velocity for monitoring and next step
+                        delta_pred_raw = self.denormalize_delta(delta_mu_norm)
+                        vel_pred_raw = prev_vel_raw_current.unsqueeze(0) + delta_pred_raw
+
+                        # Track velocity reconstruction error (for monitoring)
+                        batch_vel_error += F.l1_loss(vel_pred_raw, vel_gt_raw).item()
+
+                        # Scheduled sampling: choose GT or predicted for next prev_vel
                         if np.random.random() < tf_ratio:
-                            prev_vel = vel_gt.squeeze(0).detach()
+                            # Teacher forcing: use GT velocity
+                            prev_vel_raw_current = vel_gt_raw.squeeze(0).detach()
+                            prev_vel_norm = self.normalize_velocity(prev_vel_raw_current)
                             total_tf_frames += 1
                         else:
-                            prev_vel = vel_mu.squeeze(0).detach()
+                            # Use predicted velocity
+                            prev_vel_raw_current = vel_pred_raw.squeeze(0).detach()
+                            prev_vel_norm = self.normalize_velocity(prev_vel_raw_current)
                             total_pred_frames += 1
 
                     n_sequences += 1
@@ -302,6 +371,7 @@ class VelNetTrainer:
                 scaler.step(self.optimizer)
                 scaler.update()
                 total_loss += avg_loss.item()
+                total_vel_error += batch_vel_error / batch_frames
 
             if pbar is not None:
                 pbar.update(1)
@@ -316,6 +386,7 @@ class VelNetTrainer:
 
         return {
             'train/loss': total_loss / n_batches,
+            'train/vel_mae': total_vel_error / n_batches,  # Reconstructed velocity MAE
             'train/tf_ratio_target': tf_ratio,
             'train/tf_ratio_actual': actual_tf_ratio,
             'train/tf_frames': total_tf_frames,
@@ -324,7 +395,10 @@ class VelNetTrainer:
 
     @torch.no_grad()
     def validate_autoregressive(self) -> Dict[str, float]:
-        """Validate using auto-regressive inference (0% teacher forcing, uses precomputed features)."""
+        """Validate using auto-regressive inference with RESIDUAL prediction.
+
+        RESIDUAL MODE: Model outputs delta, velocity = prev_vel + delta
+        """
         from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 
         self.model.eval()
@@ -341,11 +415,13 @@ class VelNetTrainer:
                 orientations = batch['orientations'][b_idx].to(self.device)
                 actions = batch['actions'][b_idx].to(self.device)
                 prev_actions = batch['prev_actions'][b_idx].to(self.device)
-                velocities_gt_raw = batch['velocities_gt'][b_idx].to(self.device)  # Keep raw for metrics
-                prev_vel_raw = batch['initial_prev_vels'][b_idx].to(self.device)
+                velocities_gt_raw = batch['velocities_gt'][b_idx].to(self.device)  # Raw GT for metrics
+                prev_vel_raw = batch['initial_prev_vels'][b_idx].to(self.device)  # Raw (m/s)
 
-                # Normalize initial prev_vel for model input
-                prev_vel = self.normalize_velocity(prev_vel_raw)
+                # For model INPUT: normalize prev_vel
+                prev_vel_norm = self.normalize_velocity(prev_vel_raw)
+                # Keep raw prev_vel for residual calculation
+                prev_vel_raw_current = prev_vel_raw.clone()
 
                 # Load precomputed backbone features (already on GPU)
                 rgb_backbone, depth_backbone = self._load_backbone_features(seq_path)
@@ -367,24 +443,27 @@ class VelNetTrainer:
                         rot6d_all[t:t+1],
                         actions[t:t+1],
                         prev_actions[t:t+1],
-                        prev_vel.unsqueeze(0),  # Normalized
+                        prev_vel_norm.unsqueeze(0),  # Normalized input
                         rgb_feat_all[t:t+1],
                         depth_feat_all[t:t+1],
                     ], dim=1)
 
-                    vel_mu_norm, _ = self.model.encode_step(obs)  # Model outputs normalized
+                    # Model outputs DELTA (normalized)
+                    delta_mu_norm, _ = self.model.encode_step(obs)
 
-                    # Denormalize prediction for metrics (in m/s)
-                    vel_mu = self.denormalize_velocity(vel_mu_norm)
+                    # Reconstruct velocity: vel_pred = prev_vel + delta
+                    delta_raw = self.denormalize_delta(delta_mu_norm)
+                    vel_pred = prev_vel_raw_current.unsqueeze(0) + delta_raw
                     vel_gt = velocities_gt_raw[t:t+1]  # Raw GT in m/s
 
-                    error = torch.abs(vel_mu - vel_gt).cpu().numpy()[0]
+                    error = torch.abs(vel_pred - vel_gt).cpu().numpy()[0]
                     all_errors.append(error)
-                    total_mse += F.mse_loss(vel_mu, vel_gt).item()
+                    total_mse += F.mse_loss(vel_pred, vel_gt).item()
                     total_frames += 1
 
-                    # Auto-regressive: use normalized prediction as next prev_vel
-                    prev_vel = vel_mu_norm.squeeze(0)
+                    # Auto-regressive: use predicted velocity for next step
+                    prev_vel_raw_current = vel_pred.squeeze(0)
+                    prev_vel_norm = self.normalize_velocity(prev_vel_raw_current)
 
         all_errors = np.array(all_errors)
         mae = np.mean(all_errors)
@@ -496,9 +575,15 @@ class VelNetTrainer:
                 'hidden_dim': self.model.hidden_dim,
                 'gru_layers': self.model.gru_layers,
             },
-            # Velocity normalization stats (needed for inference)
+            # Normalization stats (needed for inference)
+            # vel_mean/std: for normalizing prev_vel INPUT
             'vel_mean': self.vel_mean.cpu(),
             'vel_std': self.vel_std.cpu(),
+            # delta_mean/std: for denormalizing delta OUTPUT (RESIDUAL MODE)
+            'delta_mean': self.delta_mean.cpu(),
+            'delta_std': self.delta_std.cpu(),
+            # Flag to indicate this is a residual prediction model
+            'residual_mode': True,
         }
         torch.save(checkpoint, path)
         print(f"  Saved: {path}")
@@ -521,20 +606,24 @@ def autoregressive_test(
     test_sequence_path: str,
     vel_mean: torch.Tensor,
     vel_std: torch.Tensor,
+    delta_mean: torch.Tensor = None,
+    delta_std: torch.Tensor = None,
     device: str = 'cuda:0',
     max_steps: int = 300,
     save_plot: bool = True,
     plot_path: str = None,
 ) -> Dict[str, float]:
     """
-    Test model with auto-regressive inference.
+    Test model with auto-regressive inference using RESIDUAL prediction.
 
-    Feeds predicted velocity back as prev_vel input.
-    Model expects normalized inputs and outputs normalized predictions.
+    RESIDUAL MODE: Model outputs delta (velocity change).
+    vel_pred = prev_vel + delta
 
     Args:
-        vel_mean: Velocity mean for normalization (3,)
-        vel_std: Velocity std for normalization (3,)
+        vel_mean: Velocity mean for normalizing INPUT prev_vel (3,)
+        vel_std: Velocity std for normalizing INPUT prev_vel (3,)
+        delta_mean: Delta mean for denormalizing OUTPUT (3,)
+        delta_std: Delta std for denormalizing OUTPUT (3,)
     """
     from PIL import Image
     from models.vel_net.vel_obs_utils import quaternion_to_rot6d
@@ -544,6 +633,8 @@ def autoregressive_test(
 
     vel_mean = vel_mean.to(device)
     vel_std = vel_std.to(device)
+    delta_mean = delta_mean.to(device) if delta_mean is not None else torch.zeros(3, device=device)
+    delta_std = delta_std.to(device) if delta_std is not None else torch.ones(3, device=device)
 
     seq_path = Path(test_sequence_path)
     telemetry = np.load(seq_path / "telemetry.npz")
@@ -554,8 +645,9 @@ def autoregressive_test(
     all_gts = []
     errors = []
 
-    # Start with zero velocity (normalized)
-    prev_vel_norm = (torch.zeros(1, 3, device=device) - vel_mean) / vel_std
+    # Start with zero velocity (raw)
+    prev_vel_raw = torch.zeros(3, device=device)
+    prev_vel_norm = (prev_vel_raw - vel_mean) / vel_std
 
     # Reset GRU hidden state for sequential processing
     model.reset_hidden_state(batch_size=1)
@@ -579,18 +671,23 @@ def autoregressive_test(
             action = torch.from_numpy(telemetry['actions'][t].astype(np.float32)).unsqueeze(0).to(device)
             prev_action = torch.from_numpy(telemetry['actions'][t-1].astype(np.float32)).unsqueeze(0).to(device)
 
-            obs = torch.cat([rot6d, action, prev_action, prev_vel_norm, rgb_feat, depth_feat], dim=1)
+            obs = torch.cat([rot6d, action, prev_action, prev_vel_norm.unsqueeze(0), rgb_feat, depth_feat], dim=1)
 
-            vel_mu_norm, _ = model.encode_step(obs)  # Use encode_step for GRU state
-            prev_vel_norm = vel_mu_norm.detach()  # Keep normalized for next step
+            # Model outputs DELTA (normalized)
+            delta_mu_norm, _ = model.encode_step(obs)
 
-            # Denormalize for metrics
-            vel_mu = vel_mu_norm * vel_std + vel_mean
+            # Denormalize delta and reconstruct velocity
+            delta_raw = delta_mu_norm.squeeze(0) * delta_std + delta_mean
+            vel_pred = prev_vel_raw + delta_raw
+
+            # Update for next step
+            prev_vel_raw = vel_pred.detach()
+            prev_vel_norm = (prev_vel_raw - vel_mean) / vel_std
 
             vel_gt = telemetry['velocities'][t]
-            all_preds.append(vel_mu.cpu().numpy()[0])
+            all_preds.append(vel_pred.cpu().numpy())
             all_gts.append(vel_gt)
-            errors.append(np.abs(vel_mu.cpu().numpy()[0] - vel_gt))
+            errors.append(np.abs(vel_pred.cpu().numpy() - vel_gt))
 
     all_preds = np.array(all_preds)
     all_gts = np.array(all_gts)

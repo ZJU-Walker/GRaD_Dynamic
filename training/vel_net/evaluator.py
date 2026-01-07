@@ -74,6 +74,8 @@ def fly_and_evaluate(
     encoder: DualEncoder,
     vel_mean: torch.Tensor,
     vel_std: torch.Tensor,
+    delta_mean: torch.Tensor = None,
+    delta_std: torch.Tensor = None,
     map_name: str = 'gate_mid',
     v_avg: float = 1.0,
     output_dir: str = 'output/vel_net_eval',
@@ -84,11 +86,15 @@ def fly_and_evaluate(
     """
     Fly drone through trajectory and evaluate vel_net predictions.
 
+    Uses RESIDUAL prediction mode: vel_pred = prev_vel + delta
+
     Args:
         model: Trained VELO_NET model
         encoder: Trained DualEncoder
-        vel_mean: Velocity mean for normalization (3,)
-        vel_std: Velocity std for normalization (3,)
+        vel_mean: Velocity mean for normalizing INPUT prev_vel (3,)
+        vel_std: Velocity std for normalizing INPUT prev_vel (3,)
+        delta_mean: Delta mean for denormalizing OUTPUT (3,)
+        delta_std: Delta std for denormalizing OUTPUT (3,)
         map_name: Map name
         v_avg: Average velocity (m/s)
         output_dir: Output directory for video and plots
@@ -104,6 +110,8 @@ def fly_and_evaluate(
 
     vel_mean = vel_mean.to(device)
     vel_std = vel_std.to(device)
+    delta_mean = delta_mean.to(device) if delta_mean is not None else torch.zeros(3, device=device)
+    delta_std = delta_std.to(device) if delta_std is not None else torch.ones(3, device=device)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -204,8 +212,10 @@ def fly_and_evaluate(
     start_pos_d, _, _, _ = sampler.sample(0.0)
     stabilize_steps = 50
 
-    # Initialize prev_vel for auto-regressive inference (normalized)
-    prev_vel_norm = (torch.zeros(1, 3, device=device) - vel_mean) / vel_std
+    # Initialize prev_vel for auto-regressive inference
+    # Keep both raw (for residual calc) and normalized (for model input)
+    prev_vel_raw = torch.zeros(3, device=device)
+    prev_vel_norm = (prev_vel_raw - vel_mean) / vel_std
     prev_action = torch.zeros(1, 4, device=device)
 
     # Reset GRU hidden state for sequential processing
@@ -298,20 +308,22 @@ def fly_and_evaluate(
                     rot6d,           # 6
                     action_tensor,   # 4
                     prev_action,     # 4
-                    prev_vel_norm,   # 3 (normalized)
+                    prev_vel_norm.unsqueeze(0),   # 3 (normalized)
                     rgb_feat,        # 32
                     depth_feat,      # 32
                 ], dim=1)
 
-                # Predict velocity (normalized output) - use encode_step for GRU state
-                vel_mu_norm, _ = model.encode_step(obs)
+                # Model outputs DELTA (normalized) - use encode_step for GRU state
+                delta_mu_norm, _ = model.encode_step(obs)
 
-                # Denormalize for metrics
-                vel_mu = vel_mu_norm * vel_std + vel_mean
-                vel_pred = vel_mu[0].cpu().numpy()
+                # Denormalize delta and reconstruct velocity
+                delta_raw = delta_mu_norm.squeeze(0) * delta_std + delta_mean
+                vel_pred_tensor = prev_vel_raw + delta_raw
+                vel_pred = vel_pred_tensor.cpu().numpy()
 
-                # Update prev_vel for next step (keep normalized)
-                prev_vel_norm = vel_mu_norm.detach()
+                # Update prev_vel for next step
+                prev_vel_raw = vel_pred_tensor.detach()
+                prev_vel_norm = (prev_vel_raw - vel_mean) / vel_std
 
             # Record data
             vel_gt_list.append(vel_gt.copy())
