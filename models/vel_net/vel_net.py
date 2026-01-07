@@ -107,6 +107,59 @@ class VELO_NET(nn.Module):
         self.vel_mu = nn.Linear(num_latent * 2, 3)
         self.vel_var = nn.Linear(num_latent * 2, 3)
 
+    def reset_hidden_state(self, batch_size: int = 1):
+        """
+        Reset GRU hidden state for step-by-step processing.
+
+        Call this at the start of each new sequence.
+
+        Args:
+            batch_size: Batch size for hidden state
+        """
+        device = next(self.parameters()).device
+        self._hidden_state = torch.zeros(
+            self.gru_layers, batch_size, self.hidden_dim, device=device
+        )
+
+    def encode_step(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Encode single timestep with persistent hidden state.
+
+        Use this for step-by-step training with scheduled sampling.
+        Call reset_hidden_state() at the start of each sequence.
+
+        Args:
+            obs: Single observation (B, num_obs)
+
+        Returns:
+            Tuple of (vel_mu, vel_logvar), each shape (B, 3)
+        """
+        B = obs.size(0)
+
+        # Initialize hidden state if not exists
+        if not hasattr(self, '_hidden_state') or self._hidden_state is None:
+            self.reset_hidden_state(B)
+
+        # Ensure hidden state batch size matches
+        if self._hidden_state.size(1) != B:
+            self.reset_hidden_state(B)
+
+        # Normalize
+        obs_norm = self.input_norm(obs)  # (B, num_obs)
+
+        # Project
+        projected = self.projector(obs_norm).unsqueeze(1)  # (B, 1, hidden_dim)
+
+        # GRU step with persistent hidden state
+        out, self._hidden_state = self.gru(projected, self._hidden_state)
+
+        # Head MLP
+        x = self.head(self._hidden_state[-1])  # Use last layer's hidden
+        vel_mu = self.vel_mu(x)
+        vel_logvar = self.vel_var(x)
+
+        return vel_mu, vel_logvar
+
     def encode(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encode observation history to velocity distribution parameters.
