@@ -96,17 +96,13 @@ Train the velocity network with curriculum learning:
 
 ```bash
 # Train with wandb logging
-python training/vel_net/train_vel_net.py train \
-    --data_dir data/vel_net/sequences \
-    --epochs 500 \
-    --batch_size 64 \
-    --wandb
-
-# Train without wandb
-python training/vel_net/train_vel_net.py train \
-    --data_dir data/vel_net/sequences \
-    --epochs 500 \
-    --batch_size 64
+ python training/vel_net/train_vel_net.py train \
+      --data_dir data/vel_net/sequences_0106 \
+      --epochs 500 \
+      --batch_size 16 \
+      --seq_length 32 --stride 16 \
+      --tf_start_epoch 10 --tf_end_epoch 60 \
+      --wandb --checkpoint_dir checkpoints/vel_net_0106
 ```
 
 **Options:**
@@ -120,23 +116,6 @@ python training/vel_net/train_vel_net.py train \
 | `--checkpoint_dir` | Checkpoint directory | `checkpoints/vel_net` |
 | `--resume` | Resume from checkpoint | None |
 
-**Training Stages (Curriculum Learning):**
-
-| Stage | Name | Loss | Description |
-|-------|------|------|-------------|
-| **A** | Imitation | MSE | Pure supervised learning - match ground truth velocity |
-| **B** | PINN | MSE + Physics | Adds physics-informed constraints after Stage A plateaus |
-
-- Training starts in **Stage A** with simple MSE loss
-- After validation loss stops improving for `stage_patience` epochs (default: 20), transitions to **Stage B**
-- **Stage B** adds physics-informed regularization to improve generalization
-- Early stopping triggers after `early_stop_patience` epochs (default: 30) without improvement in Stage B
-
-**Progress bar output:**
-```
-Training:  10%|████          | 50/500 [02:30<22:30] stage=A, loss=0.0234, val_mae=0.0156, lr=1.0e-04
-Epoch  50 [A]: 100%|████████████████████| 542/542 [00:03] loss=0.0234, mse=0.0234
-```
 
 ### 3. Evaluation
 
