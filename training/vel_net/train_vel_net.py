@@ -9,27 +9,32 @@ Usage:
     python training/vel_net/train_vel_net.py collect \
         --map gate_mid \
         --n_sequences 30 \
-        --freq 30 \
-        --output_dir data/vel_net/sequences
+        --v_min 0.5 --v_max 2.0
 
-    # Train model
+    # Train model (with scheduled sampling)
     python training/vel_net/train_vel_net.py train \
         --data_dir data/vel_net/sequences \
-        --epochs 500 \
-        --batch_size 64 \
+        --epochs 200 \
+        --batch_size 8 \
+        --seq_length 64 \
+        --tf_start_epoch 0 --tf_end_epoch 100 \
         --wandb
 
     # Auto-regressive test
     python training/vel_net/train_vel_net.py test \
         --checkpoint checkpoints/vel_net/best.pt \
         --test_seq data/vel_net/sequences/seq_0000
+
+    # Evaluation flight
+    python training/vel_net/train_vel_net.py eval \
+        --checkpoint checkpoints/vel_net/best.pt \
+        --map gate_mid --v_avg 1.0
 """
 
 import os
 import sys
 from pathlib import Path
 
-# Add parent directory to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 import argparse
@@ -56,20 +61,22 @@ def collect_command(args):
 
 
 def train_command(args):
-    """Run training."""
+    """Run training with scheduled sampling."""
     from training.vel_net.dataset import create_dataloaders
     from training.vel_net.trainer import VelNetTrainer, autoregressive_test
 
     device = args.device
 
     print(f"\n{'='*60}")
-    print(f"Velocity Network Training")
+    print(f"Velocity Network Training (Scheduled Sampling)")
     print(f"{'='*60}")
     print(f"  Data dir: {args.data_dir}")
     print(f"  Device: {device}")
+    print(f"  Seq length: {args.seq_length}")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Learning rate: {args.lr}")
     print(f"  Epochs: {args.epochs}")
+    print(f"  TF schedule: 100%% GT (epoch 0-{args.tf_start_epoch}) -> decay -> 0%% GT (epoch {args.tf_end_epoch}+)")
     print(f"  Wandb: {args.wandb}")
     print(f"{'='*60}\n")
 
@@ -80,11 +87,10 @@ def train_command(args):
     # Create dataloaders
     train_loader, val_loader = create_dataloaders(
         data_dir=args.data_dir,
-        encoder=encoder,
+        seq_length=args.seq_length,
+        stride=args.stride,
         batch_size=args.batch_size,
         val_ratio=args.val_ratio,
-        num_workers=args.num_workers,
-        device=device,
     )
 
     # Create model
@@ -107,9 +113,8 @@ def train_command(args):
         lr=args.lr,
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
-        pinn_weight=args.pinn_weight,
-        stage_patience=args.stage_patience,
-        early_stop_patience=args.early_stop_patience,
+        tf_start_epoch=args.tf_start_epoch,
+        tf_end_epoch=args.tf_end_epoch,
         device=device,
         checkpoint_dir=args.checkpoint_dir,
         use_wandb=args.wandb,
@@ -121,14 +126,17 @@ def train_command(args):
         trainer.load_checkpoint(args.resume)
 
     # Train
-    history = trainer.train(n_epochs=args.epochs)
+    history = trainer.train(
+        n_epochs=args.epochs,
+        early_stop_patience=args.early_stop_patience,
+    )
 
-    # Auto-regressive test on first validation sequence
-    print("\nRunning auto-regressive test...")
+    # Final auto-regressive test
+    print("\nRunning final auto-regressive test...")
     import glob
     sequences = sorted(glob.glob(str(Path(args.data_dir) / "seq_*")))
     if sequences:
-        test_seq = sequences[-1]  # Use last sequence for testing
+        test_seq = sequences[-1]
         ar_metrics = autoregressive_test(
             model=model,
             encoder=encoder,
@@ -164,7 +172,7 @@ def test_command(args):
     model.load_state_dict(checkpoint['model_state_dict'])
 
     print(f"Loaded checkpoint from {args.checkpoint}")
-    print(f"  Epoch: {checkpoint['epoch']}, Stage: {checkpoint['stage']}")
+    print(f"  Epoch: {checkpoint['epoch']}")
 
     # Run test
     metrics = autoregressive_test(
@@ -173,6 +181,48 @@ def test_command(args):
         test_sequence_path=args.test_seq,
         device=device,
         max_steps=args.max_steps,
+        save_plot=True,
+        plot_path=args.plot_path,
+    )
+
+
+def eval_command(args):
+    """Run evaluation flight with trained model."""
+    from training.vel_net.evaluator import fly_and_evaluate
+
+    device = args.device
+
+    # Load checkpoint
+    checkpoint = torch.load(args.checkpoint, map_location=device)
+
+    # Create encoder
+    encoder = DualEncoder(rgb_dim=32, depth_dim=32).to(device)
+    encoder.load_state_dict(checkpoint['encoder_state_dict'])
+
+    # Create model
+    config = checkpoint['model_config']
+    model = VELO_NET(
+        num_obs=config['num_obs'],
+        stack_size=config['stack_size'],
+        hidden_dim=config['hidden_dim'],
+        gru_layers=config['gru_layers'],
+        device=device,
+    ).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+
+    print(f"Loaded checkpoint from {args.checkpoint}")
+    print(f"  Epoch: {checkpoint['epoch']}")
+
+    # Run evaluation flight
+    fly_and_evaluate(
+        model=model,
+        encoder=encoder,
+        map_name=args.map,
+        v_avg=args.v_avg,
+        output_dir=args.output_dir,
+        device=device,
+        max_steps=args.max_steps,
+        smoothing=args.smoothing,
     )
 
 
@@ -197,9 +247,9 @@ def main():
     collect_parser.add_argument('--freq', type=float, default=30.0,
                                 help='Collection frequency (Hz)')
     collect_parser.add_argument('--v_min', type=float, default=0.5,
-                                help='Min velocity (m/s). If v_min == v_max, fixed velocity is used.')
+                                help='Min velocity (m/s)')
     collect_parser.add_argument('--v_max', type=float, default=2.0,
-                                help='Max velocity (m/s). If v_min != v_max, random velocity per sequence.')
+                                help='Max velocity (m/s)')
     collect_parser.add_argument('--smoothing', type=float, default=0.018,
                                 help='B-spline corner smoothing factor')
     collect_parser.add_argument('--device', type=str, default='cuda:0',
@@ -224,11 +274,17 @@ def main():
     train_parser.add_argument('--gru_layers', type=int, default=3,
                               help='Number of GRU layers')
 
+    # Sequence config
+    train_parser.add_argument('--seq_length', type=int, default=64,
+                              help='Sequence chunk length')
+    train_parser.add_argument('--stride', type=int, default=32,
+                              help='Stride between sequence chunks')
+
     # Training config
-    train_parser.add_argument('--epochs', type=int, default=500,
+    train_parser.add_argument('--epochs', type=int, default=200,
                               help='Maximum epochs')
-    train_parser.add_argument('--batch_size', type=int, default=64,
-                              help='Batch size')
+    train_parser.add_argument('--batch_size', type=int, default=8,
+                              help='Batch size (number of sequences)')
     train_parser.add_argument('--lr', type=float, default=1e-4,
                               help='Learning rate')
     train_parser.add_argument('--weight_decay', type=float, default=1e-5,
@@ -237,16 +293,14 @@ def main():
                               help='Gradient clipping')
     train_parser.add_argument('--val_ratio', type=float, default=0.1,
                               help='Validation ratio')
-    train_parser.add_argument('--num_workers', type=int, default=4,
-                              help='DataLoader workers')
-
-    # Curriculum config
-    train_parser.add_argument('--pinn_weight', type=float, default=0.1,
-                              help='PINN loss weight')
-    train_parser.add_argument('--stage_patience', type=int, default=20,
-                              help='Epochs before A->B transition')
     train_parser.add_argument('--early_stop_patience', type=int, default=30,
                               help='Early stopping patience')
+
+    # Scheduled sampling config
+    train_parser.add_argument('--tf_start_epoch', type=int, default=0,
+                              help='Epoch to start decaying (before = 100%% GT)')
+    train_parser.add_argument('--tf_end_epoch', type=int, default=100,
+                              help='Epoch to finish decaying (after = 0%% GT)')
 
     # Logging
     train_parser.add_argument('--wandb', action='store_true',
@@ -267,7 +321,29 @@ def main():
                              help='Path to test sequence')
     test_parser.add_argument('--max_steps', type=int, default=300,
                              help='Maximum test steps')
+    test_parser.add_argument('--plot_path', type=str, default=None,
+                             help='Path to save plot')
     test_parser.add_argument('--device', type=str, default='cuda:0',
+                             help='PyTorch device')
+
+    # =========================================================================
+    # Eval command
+    # =========================================================================
+    eval_parser = subparsers.add_parser('eval', help='Evaluate model with live flight')
+    eval_parser.add_argument('--checkpoint', type=str, required=True,
+                             help='Path to checkpoint')
+    eval_parser.add_argument('--map', type=str, default='gate_mid',
+                             choices=['gate_mid', 'gate_left', 'gate_right'],
+                             help='Map name')
+    eval_parser.add_argument('--v_avg', type=float, default=1.0,
+                             help='Average velocity (m/s)')
+    eval_parser.add_argument('--smoothing', type=float, default=0.18,
+                             help='B-spline corner smoothing')
+    eval_parser.add_argument('--max_steps', type=int, default=3000,
+                             help='Maximum simulation steps')
+    eval_parser.add_argument('--output_dir', type=str, default='output/vel_net_eval',
+                             help='Output directory')
+    eval_parser.add_argument('--device', type=str, default='cuda:0',
                              help='PyTorch device')
 
     # =========================================================================
@@ -281,6 +357,8 @@ def main():
         train_command(args)
     elif args.command == 'test':
         test_command(args)
+    elif args.command == 'eval':
+        eval_command(args)
     else:
         parser.print_help()
 
