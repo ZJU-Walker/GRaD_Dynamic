@@ -1,11 +1,20 @@
 """
-Velocity Network (VELO_NET) for drone velocity estimation.
+Velocity Network (VELO_NET) for drone velocity estimation with IMU-Vision Fusion.
 
-Auto-regressive GRU-based network with PINN (Physics-Informed Neural Network) loss.
+Auto-regressive GRU-based network with physics-informed prediction.
 Uses previous velocity prediction as input during inference.
 
+IMU FUSION MODE:
+The network fuses noisy IMU data with visual correction:
+    v_t = v_{t-1} + (a_imu * dt) + Network(obs)
+
+Where:
+- a_imu: Corrupted IMU acceleration (from dataset with augmentation)
+- Network(obs): Learned visual correction for IMU bias/drift
+
 Architecture:
-    Input (num_obs × stack_size) → LayerNorm → Projector MLP → GRU → Head MLP → Velocity (3D)
+    Input (84 dims) → LayerNorm → Projector MLP → GRU → Head MLP → Correction Delta (3D)
+    Final: vel_pred = vel_physics + correction_delta
 """
 
 import torch
@@ -33,38 +42,43 @@ def get_activation(act_name: str) -> nn.Module:
 
 class VELO_NET(nn.Module):
     """
-    Velocity estimation network with auto-regressive capability.
+    Velocity estimation network with IMU-Vision fusion.
 
-    Uses GRU to process observation history and outputs velocity distribution (mean + variance).
-    Supports Physics-Informed Neural Network (PINN) loss for incorporating drone dynamics.
+    Uses GRU to process observation history and outputs velocity correction.
+    Implements physics-informed prediction: vel = prev_vel + (accel * dt) + correction
 
     Args:
-        num_obs: Observation dimension per timestep (default: 81)
+        num_obs: Observation dimension per timestep (default: 84 with IMU)
         stack_size: Number of stacked timesteps in history (default: 1 for testing)
         num_latent: Latent dimension for head MLP (default: 64)
         activation: Activation function name (default: 'elu')
         hidden_dim: GRU and projector hidden dimension (default: 256)
         gru_layers: Number of GRU layers (default: 3)
+        dt: Time step for physics integration (default: 1/30 = 33ms)
         device: Device to place the model on (default: 'cpu')
     """
 
-    # Default observation structure indices (81 dims total)
+    # Observation structure indices (84 dims total with IMU)
     # [0:6]   - Rot6D (rotation)
     # [6:10]  - Current action
     # [10:14] - Previous action
     # [14:17] - Previous velocity (auto-regressive term)
     # [17:49] - RGB features (32 dims)
     # [49:81] - Depth features (32 dims)
+    # [81:84] - Acceleration/IMU (3 dims)
     PREV_VEL_START_IDX = 14
     PREV_VEL_END_IDX = 17
+    ACCEL_START_IDX = 81
+    ACCEL_END_IDX = 84
 
     def __init__(self,
-                 num_obs: int = 81,
+                 num_obs: int = 84,
                  stack_size: int = 1,
                  num_latent: int = 64,
                  activation: str = 'elu',
                  hidden_dim: int = 256,
                  gru_layers: int = 3,
+                 dt: float = 1.0 / 30.0,
                  device: str = 'cpu'):
         super(VELO_NET, self).__init__()
 
@@ -73,6 +87,7 @@ class VELO_NET(nn.Module):
         self.num_latent = num_latent
         self.hidden_dim = hidden_dim
         self.gru_layers = gru_layers
+        self.dt = dt
         self.device = device
 
         act_fn = get_activation(activation)
@@ -121,18 +136,25 @@ class VELO_NET(nn.Module):
             self.gru_layers, batch_size, self.hidden_dim, device=device
         )
 
-    def encode_step(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode_step(self, obs: torch.Tensor, prev_vel_raw: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode single timestep with persistent hidden state.
+        Encode single timestep with physics-informed IMU-Vision fusion.
+
+        IMU FUSION: vel_pred = vel_physics + correction_delta
+        Where: vel_physics = prev_vel + (accel * dt)
 
         Use this for step-by-step training with scheduled sampling.
         Call reset_hidden_state() at the start of each sequence.
 
         Args:
-            obs: Single observation (B, num_obs)
+            obs: Single observation (B, num_obs) with accel in last 3 dims
+            prev_vel_raw: Previous velocity in raw units (B, 3) for physics integration.
+                         If None, extracts from obs[14:17] (but this may be normalized).
 
         Returns:
             Tuple of (vel_mu, vel_logvar), each shape (B, 3)
+            Note: vel_mu is the CORRECTION DELTA, not absolute velocity!
+                  Caller must add: vel_pred = vel_physics + vel_mu
         """
         B = obs.size(0)
 
@@ -144,7 +166,7 @@ class VELO_NET(nn.Module):
         if self._hidden_state.size(1) != B:
             self.reset_hidden_state(B)
 
-        # Normalize
+        # Normalize observation (network sees normalized version)
         obs_norm = self.input_norm(obs)  # (B, num_obs)
 
         # Project
@@ -153,12 +175,47 @@ class VELO_NET(nn.Module):
         # GRU step with persistent hidden state
         out, self._hidden_state = self.gru(projected, self._hidden_state)
 
-        # Head MLP
+        # Head MLP outputs CORRECTION DELTA
         x = self.head(self._hidden_state[-1])  # Use last layer's hidden
-        vel_mu = self.vel_mu(x)
-        vel_logvar = self.vel_var(x)
+        correction_mu = self.vel_mu(x)
+        correction_logvar = self.vel_var(x)
 
-        return vel_mu, vel_logvar
+        return correction_mu, correction_logvar
+
+    def physics_integrate(self, prev_vel: torch.Tensor, accel: torch.Tensor, dt: float = None) -> torch.Tensor:
+        """
+        Physics-based velocity integration (dead reckoning).
+
+        Args:
+            prev_vel: Previous velocity (B, 3) in m/s
+            accel: Acceleration/IMU reading (B, 3) in m/s^2
+            dt: Time step (uses self.dt if None)
+
+        Returns:
+            vel_physics: Physics-predicted velocity (B, 3)
+        """
+        if dt is None:
+            dt = self.dt
+        return prev_vel + accel * dt
+
+    def fuse_imu_vision(self, prev_vel: torch.Tensor, accel: torch.Tensor,
+                        correction: torch.Tensor, dt: float = None) -> torch.Tensor:
+        """
+        Fuse IMU prediction with visual correction.
+
+        v_t = v_{t-1} + (a_imu * dt) + correction
+
+        Args:
+            prev_vel: Previous velocity (B, 3) in m/s
+            accel: IMU acceleration (B, 3) in m/s^2
+            correction: Visual correction delta (B, 3) from network
+            dt: Time step (uses self.dt if None)
+
+        Returns:
+            vel_pred: Fused velocity prediction (B, 3)
+        """
+        vel_physics = self.physics_integrate(prev_vel, accel, dt)
+        return vel_physics + correction
 
     def encode(self, obs_history: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -453,6 +510,7 @@ class VELO_NET(nn.Module):
                 'num_latent': self.num_latent,
                 'hidden_dim': self.hidden_dim,
                 'gru_layers': self.gru_layers,
+                'dt': self.dt,
             },
             'iteration': iteration,
         }
@@ -483,6 +541,7 @@ class VELO_NET(nn.Module):
             num_latent=config['num_latent'],
             hidden_dim=config['hidden_dim'],
             gru_layers=config['gru_layers'],
+            dt=config.get('dt', 1.0 / 30.0),  # Default for backward compatibility
             device=device
         )
         model.load_state_dict(checkpoint['model_state_dict'])

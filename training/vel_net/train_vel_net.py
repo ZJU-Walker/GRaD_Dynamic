@@ -93,9 +93,9 @@ def train_command(args):
         val_ratio=args.val_ratio,
     )
 
-    # Create model
+    # Create model (84 dims with IMU fusion)
     model = VELO_NET(
-        num_obs=81,
+        num_obs=84,  # 81 + 3 for IMU accel
         stack_size=1,
         num_latent=args.num_latent,
         hidden_dim=args.hidden_dim,

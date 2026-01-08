@@ -218,6 +218,10 @@ def fly_and_evaluate(
     prev_vel_norm = (prev_vel_raw - vel_mean) / vel_std
     prev_action = torch.zeros(1, 4, device=device)
 
+    # Track previous GT velocity for IMU acceleration computation
+    prev_vel_gt = np.zeros(3)
+    model_dt = getattr(model, 'dt', 1.0 / 30.0)  # Model's expected dt
+
     # Reset GRU hidden state for sequential processing
     model.reset_hidden_state(batch_size=1)
 
@@ -304,6 +308,10 @@ def fly_and_evaluate(
 
                 action_tensor = torch.from_numpy(action.astype(np.float32)).unsqueeze(0).to(device)
 
+                # Compute IMU acceleration from GT velocity derivative
+                accel_gt = (vel_gt - prev_vel_gt) / model_dt
+                accel_tensor = torch.from_numpy(accel_gt.astype(np.float32)).unsqueeze(0).to(device)
+
                 obs = torch.cat([
                     rot6d,           # 6
                     action_tensor,   # 4
@@ -311,14 +319,16 @@ def fly_and_evaluate(
                     prev_vel_norm.unsqueeze(0),   # 3 (normalized)
                     rgb_feat,        # 32
                     depth_feat,      # 32
+                    accel_tensor,    # 3 (IMU acceleration)
                 ], dim=1)
 
-                # Model outputs DELTA (normalized) - use encode_step for GRU state
-                delta_mu_norm, _ = model.encode_step(obs)
+                # Model outputs CORRECTION (normalized) - use encode_step for GRU state
+                correction_mu_norm, _ = model.encode_step(obs)
 
-                # Denormalize delta and reconstruct velocity
-                delta_raw = delta_mu_norm.squeeze(0) * delta_std + delta_mean
-                vel_pred_tensor = prev_vel_raw + delta_raw
+                # Denormalize correction and reconstruct velocity via physics + correction
+                correction_raw = correction_mu_norm.squeeze(0) * delta_std + delta_mean
+                vel_physics = prev_vel_raw + accel_tensor.squeeze(0) * model_dt
+                vel_pred_tensor = vel_physics + correction_raw
                 vel_pred = vel_pred_tensor.cpu().numpy()
 
                 # Update prev_vel for next step
@@ -329,6 +339,9 @@ def fly_and_evaluate(
             vel_gt_list.append(vel_gt.copy())
             vel_pred_list.append(vel_pred.copy())
             timestamps.append(t)
+
+        # Always update prev_vel_gt for next acceleration computation (even during stabilization)
+        prev_vel_gt = vel_gt.copy()
 
         # Update prev_action for next step
         prev_action = torch.from_numpy(action.astype(np.float32)).unsqueeze(0).to(device)
