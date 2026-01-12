@@ -263,6 +263,7 @@ def eval_command(args):
         device=device,
         max_steps=args.max_steps,
         smoothing=args.smoothing,
+        imu_noise=args.imu_noise,
     )
 
 
@@ -383,6 +384,8 @@ def main():
                              help='Maximum simulation steps')
     eval_parser.add_argument('--output_dir', type=str, default='output/vel_net_eval',
                              help='Output directory')
+    eval_parser.add_argument('--imu_noise', action='store_true',
+                             help='Add IMU noise augmentation for realistic testing')
     eval_parser.add_argument('--device', type=str, default='cuda:0',
                              help='PyTorch device')
 

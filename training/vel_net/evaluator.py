@@ -30,6 +30,7 @@ from controller.nav_helpers import (
 from models.vel_net import VELO_NET
 from models.vel_net.visual_encoder import DualEncoder
 from models.vel_net.vel_obs_utils import quaternion_to_rot6d
+from training.vel_net.dataset import IMUAugmentation
 
 
 # Map configurations (same as waypoint_nav_geometric.py)
@@ -82,6 +83,7 @@ def fly_and_evaluate(
     device: str = 'cuda:0',
     max_steps: int = 3000,
     smoothing: float = 0.18,
+    imu_noise: bool = False,
 ) -> Dict[str, float]:
     """
     Fly drone through trajectory and evaluate vel_net predictions.
@@ -101,6 +103,7 @@ def fly_and_evaluate(
         device: PyTorch device
         max_steps: Maximum simulation steps
         smoothing: B-spline corner smoothing
+        imu_noise: Whether to add IMU noise augmentation (for realistic testing)
 
     Returns:
         Dict with evaluation metrics
@@ -112,6 +115,17 @@ def fly_and_evaluate(
     vel_std = vel_std.to(device)
     delta_mean = delta_mean.to(device) if delta_mean is not None else torch.zeros(3, device=device)
     delta_std = delta_std.to(device) if delta_std is not None else torch.ones(3, device=device)
+
+    # IMU noise augmentation (sample bias/scale once per flight, like per-sequence in training)
+    imu_aug = None
+    imu_bias = np.zeros(3)
+    imu_scale = np.ones(3)
+    if imu_noise:
+        imu_aug = IMUAugmentation(enabled=True)
+        # Sample constant bias and scale for this flight (per-sequence augmentation)
+        imu_bias = np.random.uniform(-imu_aug.bias_range, imu_aug.bias_range, size=3)
+        imu_scale = np.random.uniform(1.0 - imu_aug.scale_range, 1.0 + imu_aug.scale_range, size=3)
+        print(f"  IMU noise enabled: bias={imu_bias}, scale={imu_scale}")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -310,7 +324,18 @@ def fly_and_evaluate(
 
                 # Compute IMU acceleration from GT velocity derivative
                 accel_gt = (vel_gt - prev_vel_gt) / model_dt
-                accel_tensor = torch.from_numpy(accel_gt.astype(np.float32)).unsqueeze(0).to(device)
+
+                # Apply IMU noise if enabled (matches training augmentation)
+                if imu_noise:
+                    accel_aug = accel_gt.copy()
+                    accel_aug = accel_aug + imu_bias  # constant bias per flight
+                    accel_aug = accel_aug * imu_scale  # constant scale per flight
+                    accel_aug = accel_aug + np.random.normal(0, imu_aug.noise_std, size=3)  # per-frame noise
+                    if np.random.random() < imu_aug.dropout_prob:  # sensor dropout
+                        accel_aug = np.zeros(3)
+                    accel_tensor = torch.from_numpy(accel_aug.astype(np.float32)).unsqueeze(0).to(device)
+                else:
+                    accel_tensor = torch.from_numpy(accel_gt.astype(np.float32)).unsqueeze(0).to(device)
 
                 obs = torch.cat([
                     rot6d,           # 6
