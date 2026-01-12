@@ -42,6 +42,7 @@ class GradNav:
 
         seeding(cfg["params"]["general"]["seed"])
         env_hyper = cfg["params"].get("env_hyper", None)
+        vel_net_cfg = cfg["params"].get("vel_net", None)
         self.env = env_fn(num_envs = cfg["params"]["config"]["num_actors"], \
                             device = cfg["params"]["general"]["device"], \
                             render = cfg["params"]["general"]["render"], \
@@ -51,6 +52,7 @@ class GradNav:
                             MM_caching_frequency = cfg["params"]['diff_env'].get('MM_caching_frequency', 1), \
                             map_name = self.map_name,
                             env_hyper = env_hyper,
+                            vel_net_cfg = vel_net_cfg,
                             no_grad = False)
 
         print('num_envs = ', self.env.num_envs)
