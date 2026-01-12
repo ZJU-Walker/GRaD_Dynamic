@@ -25,6 +25,8 @@ from utils.rotation import quaternion_to_euler, quaternion_yaw_forward
 from utils.hist_obs_buffer import ObsHistBuffer
 from utils.time_report import TimeReport
 from models.policy.squeeze_net import VisualPerceptionNet
+from models.vel_net import VELO_NET, DualEncoder
+from models.vel_net.vel_obs_utils import quaternion_to_rot6d, build_vel_observation
 
 
 class ExpertDroneEnv(SimpleDroneEnv):
@@ -47,6 +49,7 @@ class ExpertDroneEnv(SimpleDroneEnv):
         early_termination: bool = True,
         map_name: str = 'gate_mid',
         env_hyper: dict = None,
+        vel_net_cfg: dict = None,
     ):
         # Initialize base SimpleDroneEnv (like original line 60)
         super().__init__(
@@ -121,6 +124,17 @@ class ExpertDroneEnv(SimpleDroneEnv):
 
         # Visual perception net (line 217)
         self.visual_net = VisualPerceptionNet(visual_feature_size=self.visual_feature_size).to(self.device)
+
+        # vel_net initialization
+        self.vel_net_cfg = vel_net_cfg if vel_net_cfg is not None else {}
+        self.vel_net_enabled = self.vel_net_cfg.get('enabled', False)
+        self.vel_net_eval_compare = self.vel_net_cfg.get('eval_compare', True)
+
+        if self.vel_net_enabled:
+            self._init_vel_net()
+        else:
+            self.vel_net = None
+            self.dual_encoder = None
 
         # Observation history buffer for VAE (lines 220-224)
         self.obs_hist_buf = ObsHistBuffer(
@@ -277,6 +291,177 @@ class ExpertDroneEnv(SimpleDroneEnv):
         # For now, use waypoints as ref_traj
         traj_wp = self.reward_wp + self.point_cloud_offset[0].repeat((self.reward_wp.shape[0], 1))
         self.ref_traj = traj_wp  # Simplified - full implementation uses traj_planner
+
+    def _init_vel_net(self):
+        """Initialize velocity network for evaluation comparison."""
+        checkpoint_path = self.vel_net_cfg.get('checkpoint_path', None)
+
+        if not os.path.exists(checkpoint_path):
+            print(f"[vel_net] Warning: Checkpoint not found at {checkpoint_path}, disabling vel_net")
+            assert False, "Vel_net checkpoint path is invalid."
+            self.vel_net_enabled = False
+            self.vel_net = None
+            self.dual_encoder = None
+            return
+
+        print(f"[vel_net] Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Load model config
+        model_config = checkpoint.get('model_config', checkpoint.get('config', {}))
+        num_obs = model_config.get('num_obs', 84)
+        hidden_dim = model_config.get('hidden_dim', 256)
+        gru_layers = model_config.get('gru_layers', 3)
+        dt = model_config.get('dt', 1.0 / 30.0)
+
+        # Initialize VELO_NET
+        self.vel_net = VELO_NET(
+            num_obs=num_obs,
+            stack_size=1,
+            hidden_dim=hidden_dim,
+            gru_layers=gru_layers,
+            dt=dt,
+            device=self.device
+        ).to(self.device)
+        self.vel_net.load_state_dict(checkpoint['model_state_dict'])
+        self.vel_net.eval()
+
+        # Freeze vel_net parameters
+        for param in self.vel_net.parameters():
+            param.requires_grad = False
+
+        # Initialize DualEncoder
+        self.dual_encoder = DualEncoder(rgb_dim=32, depth_dim=32).to(self.device)
+        if 'encoder_state_dict' in checkpoint:
+            self.dual_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+        self.dual_encoder.eval()
+
+        # Freeze DualEncoder parameters
+        for param in self.dual_encoder.parameters():
+            param.requires_grad = False
+
+        # Load normalization stats
+        self.vel_mean = checkpoint.get('vel_mean', torch.zeros(3)).to(self.device)
+        self.vel_std = checkpoint.get('vel_std', torch.ones(3)).to(self.device)
+        self.delta_mean = checkpoint.get('delta_mean', torch.zeros(3)).to(self.device)
+        self.delta_std = checkpoint.get('delta_std', torch.ones(3)).to(self.device)
+
+        # Initialize vel_net buffers
+        self.vel_net_obs = torch.zeros([self.num_envs, 84], device=self.device)
+        self.pred_vel_prev = torch.zeros([self.num_envs, 3], device=self.device)
+        self.pred_vel_current = torch.zeros([self.num_envs, 3], device=self.device)
+
+        # DualEncoder features (computed in process_GS_data)
+        self.rgb_feat_vel = torch.zeros([self.num_envs, 32], device=self.device)
+        self.depth_feat_vel = torch.zeros([self.num_envs, 32], device=self.device)
+
+        # Velocity tracking for evaluation comparison
+        self.gt_vel_history = []
+        self.pred_vel_history = []
+
+        print(f"[vel_net] Initialized: num_obs={num_obs}, hidden_dim={hidden_dim}, dt={dt:.4f}")
+
+    def _save_vel_comparison_plot(self):
+        """Save velocity comparison plot (GT vs vel_net predicted) during evaluation."""
+        if not self.gt_vel_history or not self.pred_vel_history:
+            return
+
+        import matplotlib.pyplot as plt
+
+        gt_vel = np.array(self.gt_vel_history)   # (T, 3)
+        pred_vel = np.array(self.pred_vel_history)  # (T, 3)
+
+        T = len(gt_vel)
+        time_steps = np.arange(T) * self.dt
+
+        fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+
+        # Plot vx
+        axes[0].plot(time_steps, gt_vel[:, 0], 'b-', label='GT vx', linewidth=1.5)
+        axes[0].plot(time_steps, pred_vel[:, 0], 'r--', label='Pred vx', linewidth=1.5)
+        axes[0].set_ylabel('vx (m/s)')
+        axes[0].legend(loc='upper right')
+        axes[0].grid(True, alpha=0.3)
+        axes[0].set_title('Velocity Comparison: Ground Truth vs vel_net Prediction')
+
+        # Plot vy
+        axes[1].plot(time_steps, gt_vel[:, 1], 'b-', label='GT vy', linewidth=1.5)
+        axes[1].plot(time_steps, pred_vel[:, 1], 'r--', label='Pred vy', linewidth=1.5)
+        axes[1].set_ylabel('vy (m/s)')
+        axes[1].legend(loc='upper right')
+        axes[1].grid(True, alpha=0.3)
+
+        # Plot vz
+        axes[2].plot(time_steps, gt_vel[:, 2], 'b-', label='GT vz', linewidth=1.5)
+        axes[2].plot(time_steps, pred_vel[:, 2], 'r--', label='Pred vz', linewidth=1.5)
+        axes[2].set_ylabel('vz (m/s)')
+        axes[2].legend(loc='upper right')
+        axes[2].grid(True, alpha=0.3)
+
+        # Plot error magnitude
+        error = np.linalg.norm(gt_vel - pred_vel, axis=1)
+        mae = np.mean(error)
+        axes[3].plot(time_steps, error, 'g-', linewidth=1.5)
+        axes[3].axhline(y=mae, color='r', linestyle='--', label=f'MAE: {mae:.4f} m/s')
+        axes[3].set_ylabel('Error (m/s)')
+        axes[3].set_xlabel('Time (s)')
+        axes[3].legend(loc='upper right')
+        axes[3].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # Save to the same directory as other viz files
+        save_path = os.path.join(self.save_path, 'vel_comparison.png')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        print(f"[vel_net] Saved velocity comparison plot to {save_path}")
+        print(f"[vel_net] MAE: {mae:.4f} m/s over {T} steps")
+
+    def _build_vel_net_obs_and_infer(self, torso_quat, lin_vel, lin_acceleration):
+        """Build vel_net observation and run inference for evaluation comparison.
+
+        Args:
+            torso_quat: Quaternion (N, 4) in xyzw format
+            lin_vel: Ground truth linear velocity (N, 3) - used for tracking
+            lin_acceleration: Linear acceleration (N, 3) - used as IMU input
+        """
+        with torch.no_grad():
+            # Convert quaternion to rot6d
+            rot6d = quaternion_to_rot6d(torso_quat)  # (N, 6)
+
+            # Normalize previous predicted velocity for input
+            prev_vel_normalized = (self.pred_vel_prev - self.vel_mean) / (self.vel_std + 1e-8)
+
+            # Build vel_net observation (84 dims)
+            self.vel_net_obs = build_vel_observation(
+                rot6d=rot6d,                          # 0:6
+                action=self.actions,                   # 6:10
+                prev_action=self.prev_actions,         # 10:14
+                prev_vel=prev_vel_normalized,          # 14:17 (normalized)
+                rgb_feat=self.rgb_feat_vel,            # 17:49
+                depth_feat=self.depth_feat_vel,        # 49:81
+                accel=lin_acceleration,                # 81:84 (IMU)
+            )
+
+            # Run vel_net inference
+            correction_mu, _ = self.vel_net.encode_step(self.vel_net_obs)
+
+            # Denormalize correction
+            correction = correction_mu * self.delta_std + self.delta_mean
+
+            # Physics-informed fusion: vel_pred = prev_vel + accel * dt + correction
+            vel_physics = self.pred_vel_prev + lin_acceleration * self.vel_net.dt
+            self.pred_vel_current = vel_physics + correction
+
+            # Update previous predicted velocity for next step (auto-regressive)
+            self.pred_vel_prev = self.pred_vel_current.clone()
+
+            # Track velocities for evaluation comparison (only during visualization/eval)
+            if self.visualize and self.vel_net_eval_compare:
+                # Store only first environment's data for plotting
+                self.gt_vel_history.append(lin_vel[0].cpu().numpy().copy())
+                self.pred_vel_history.append(self.pred_vel_current[0].cpu().numpy().copy())
 
     def step(self, actions, vae_info):
         """
@@ -453,6 +638,17 @@ class ExpertDroneEnv(SimpleDroneEnv):
             # Clear VAE variables (line 530)
             self.latent_vect[env_ids] = torch.zeros([len(env_ids), self.num_latent], device=self.device, dtype=torch.float)
 
+            # Reset vel_net state for reset environments
+            if self.vel_net_enabled and self.vel_net is not None:
+                self.pred_vel_prev[env_ids] = torch.zeros([len(env_ids), 3], device=self.device)
+                self.pred_vel_current[env_ids] = torch.zeros([len(env_ids), 3], device=self.device)
+                # Reset vel_net hidden state (resets for all envs, but that's ok for batched reset)
+                self.vel_net.reset_hidden_state(self.num_envs)
+                # Clear velocity history on full reset (visualization mode)
+                if self.visualize and len(env_ids) == self.num_envs:
+                    self.gt_vel_history = []
+                    self.pred_vel_history = []
+
             self.progress_buf[env_ids] = 0
             self.calculateObservations()
 
@@ -460,7 +656,7 @@ class ExpertDroneEnv(SimpleDroneEnv):
     
     def process_GS_data(self, depth_list, rgb_img):
         """Process GS render output. Source: lines 580-589"""
-        batch, H, W, ch = depth_list.shape
+        _, H, _, _ = depth_list.shape
         depth_list_up = depth_list[:, 0:int(H/2), :, :]
         self.depth_list = torch.abs(torch.amin(depth_list_up, dim=(1, 2, 3))).unsqueeze(1).to(device=self.device)
 
@@ -468,6 +664,15 @@ class ExpertDroneEnv(SimpleDroneEnv):
         resize = nn.AdaptiveAvgPool2d((224, 224))
         visual_tensor = resize(visual_tensor).to(self.device)
         self.visual_info = self.visual_net(visual_tensor).detach()
+
+        # Process through DualEncoder for vel_net (if enabled)
+        if self.vel_net_enabled and self.dual_encoder is not None:
+            with torch.no_grad():
+                # RGB: already (B, 3, H, W) format after permute
+                # Depth: need to convert to (B, 1, H, W)
+                depth_tensor = depth_list.permute(0, 3, 1, 2)  # (B, H, W, 1) -> (B, 1, H, W)
+                depth_tensor = resize(depth_tensor).to(self.device)
+                self.rgb_feat_vel, self.depth_feat_vel = self.dual_encoder(visual_tensor, depth_tensor)
 
     def calculateObservations(self):
         """
@@ -569,6 +774,10 @@ class ExpertDroneEnv(SimpleDroneEnv):
             print("vae obs buf nan")
             self.vae_obs_buf = torch.nan_to_num(self.vae_obs_buf, nan=0.0, posinf=1e3, neginf=-1e3)
 
+        # vel_net observation and inference (for evaluation comparison)
+        if self.vel_net_enabled and self.vel_net is not None:
+            self._build_vel_net_obs_and_infer(torso_quat, lin_vel, lin_acceleration)
+
     def calculateReward(self):
         """
         Calculate rewards and check termination.
@@ -606,6 +815,8 @@ class ExpertDroneEnv(SimpleDroneEnv):
             episode_count = self.progress_buf[0].item()
             if episode_count == (self.cfg.episode_length - 1) or combined_condition.any():
                 self.viz_recorder.save_recordings(self.reward_wp, self.target)
+                if self.vel_net_enabled and self.vel_net_eval_compare: # Save vel_net comparison plot (if enabled)
+                    self._save_vel_comparison_plot()
 
     def clear_grad(self, checkpoint=None):
         """Clear gradients. Source: lines 538-560"""
