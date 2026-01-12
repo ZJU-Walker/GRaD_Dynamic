@@ -300,3 +300,16 @@ GRaD_Dynamic_onboard/
 | `gate_mid` | [-6, 0, 1.2] | 4 waypoints | [7.5, -2, 1.2] |
 | `gate_left` | [-6, 0, 1.2] | 3 waypoints | [7, -2, 1.2] |
 | `gate_right` | [-6, 0, 1.3] | 5 waypoints | [7, -2, 1.3] |
+
+
+# GRaD Nav policy
+## To train a gradnav policy:
+```
+python examples/train_gradnav.py     --cfg examples/cfg/gradnav/drone_test.yaml     --logdir checkpoints/gradnav_test     --device cuda:0
+
+```
+
+## To eval a gradnav policy:
+```
+ python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_test.yaml --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/examples/logs/gradnav_test/gate_mid/gradnav_migration_test2/best_policy.pt  --play --render
+ ```
