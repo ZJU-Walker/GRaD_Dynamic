@@ -144,3 +144,27 @@ def tf_combine(q1, t1, q2, t2):
 def get_basis_vector(q, v):
     """Get basis vector rotated by quaternion."""
     return quat_rotate(q, v)
+
+def grad_norm(params):
+    """Calculate gradient norm across all parameters."""
+    grad_norm = 0.
+    for p in params:
+        if p.grad is not None:
+            grad_norm += torch.sum(p.grad ** 2)
+    return torch.sqrt(grad_norm)
+
+
+def calculate_max_mean_gradient(parameters):
+    """Calculate max and mean absolute gradient values."""
+    gradients = []
+    for param in parameters:
+        if param.grad is not None:
+            gradients.append(param.grad.view(-1))
+
+    if gradients:
+        gradients = torch.cat(gradients)
+        mean_gradient = torch.mean(torch.abs(gradients))
+        max_gradient = torch.max(torch.abs(gradients))
+        return max_gradient, mean_gradient
+    else:
+        return None, None
