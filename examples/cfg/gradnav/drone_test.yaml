@@ -5,6 +5,11 @@ params:
     episode_length: 800
     MM_caching_frequency: 16
 
+  vel_net:
+    checkpoint_path: "/home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/vel_net_imu_fusion/best.pt"
+    enabled: true
+    eval_compare: true
+
   network:
     actor: ActorStochasticMLP
     actor_mlp:
