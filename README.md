@@ -1,6 +1,6 @@
 # GRaD_Dynamic_onboard
 
-Drone waypoint navigation system using A* path planning, B-spline trajectory generation, and SE(3) geometric controller. Includes velocity estimation network (vel_net) for learning-based state estimation.
+Drone waypoint navigation system using A* path planning, B-spline trajectory generation, SE(3) geometric controller, and velocity estimation network.
 
 ## Overview
 
@@ -8,7 +8,7 @@ The system performs:
 1. **A* Path Planning** - Finds collision-free paths through point cloud obstacles
 2. **B-Spline Trajectory Generation** - Creates smooth, flyable trajectories with velocity/acceleration profiles
 3. **Geometric Controller** - SE(3) controller for accurate trajectory tracking
-4. **Velocity Network** - Auto-regressive GRU network for velocity estimation
+4. **Velocity Network** - Auto-regressive GRU network for velocity estimation (84-dim input with IMU fusion)
 
 ---
 
@@ -169,7 +169,7 @@ python training/vel_net/train_vel_net.py eval \
 
 ## Velocity Network Architecture
 
-### Observation Structure (81 dims)
+### Observation Structure (84 dims)
 
 | Index | Component | Dims | Description |
 |-------|-----------|------|-------------|
@@ -179,15 +179,16 @@ python training/vel_net/train_vel_net.py eval \
 | 14-16 | Prev Velocity | 3 | Auto-regressive term (GT for training, predicted for inference) |
 | 17-48 | RGB Features | 32 | MobileNetV3 encoder output |
 | 49-80 | Depth Features | 32 | MobileNetV3 encoder output |
+| 81-83 | IMU Accel | 3 | Linear acceleration from IMU |
 
 ### Model Architecture
 
 ```
-Input (81 dims)
+Input (84 dims)
     ↓
 LayerNorm
     ↓
-Projector MLP (81 → 256)
+Projector MLP (84 → 256)
     ↓
 GRU (3 layers, 256 hidden)
     ↓
@@ -204,27 +205,32 @@ vel_mu / vel_var → Velocity (3D)
 ### Usage Example
 
 ```python
-from models.vel_net import VELO_NET, DualEncoder, build_vel_observation_from_quat
+from models.vel_net import VELO_NET, DualEncoder
+from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 
 # Create model and encoder
-model = VELO_NET(num_obs=81, stack_size=1, device='cuda:0')
+model = VELO_NET(num_obs=84, stack_size=1, device='cuda:0')
 encoder = DualEncoder(rgb_dim=32, depth_dim=32)
 
 # Encode images
 rgb_feat, depth_feat = encoder(rgb_image, depth_image)
 
-# Build observation
-obs = build_vel_observation_from_quat(
-    quat=quaternion,          # (B, 4) xyzw
-    action=action,            # (B, 4)
-    prev_action=prev_action,  # (B, 4)
-    prev_vel=prev_vel,        # (B, 3)
-    rgb_feat=rgb_feat,        # (B, 32)
-    depth_feat=depth_feat,    # (B, 32)
-)
+# Build observation (84 dims)
+rot6d = quaternion_to_rot6d(quaternion)  # (B, 6)
+obs = torch.cat([
+    rot6d,                    # (B, 6)
+    action,                   # (B, 4)
+    prev_action,              # (B, 4)
+    prev_vel,                 # (B, 3) - normalized
+    rgb_feat,                 # (B, 32)
+    depth_feat,               # (B, 32)
+    imu_accel,                # (B, 3)
+], dim=1)
 
-# Predict velocity
-vel_mu, vel_logvar = model.encode(obs)
+# Predict velocity correction (physics-informed)
+correction_norm, _ = model.forward(obs)
+correction = correction_norm * delta_std + delta_mean
+velocity = prev_vel + imu_accel * dt + correction
 ```
 
 ---
@@ -235,17 +241,24 @@ vel_mu, vel_logvar = model.encode(obs)
 GRaD_Dynamic_onboard/
 ├── models/
 │   └── vel_net/                      # Velocity estimation network
-│       ├── vel_net.py                # VELO_NET model (81-dim input)
-│       ├── visual_encoder.py         # MobileNetV3 encoder
+│       ├── vel_net.py                # VELO_NET model (84-dim input)
+│       ├── visual_encoder.py         # MobileNetV3 DualEncoder
 │       ├── vel_obs_buffer.py         # History buffer
 │       └── vel_obs_utils.py          # Rot6D, observation builders
 │
 ├── training/
-│   └── vel_net/                      # Training pipeline
+│   └── vel_net/                      # Vel_net training pipeline
 │       ├── data_collector.py         # Flight data collection
 │       ├── dataset.py                # PyTorch Dataset
 │       ├── trainer.py                # Curriculum learning trainer
+│       ├── evaluator.py              # Evaluation utilities
 │       └── train_vel_net.py          # Main entry point
+│
+├── envs/
+│   ├── drone_env.py                  # SimpleDroneEnv (base environment)
+│   └── assets/
+│       ├── quadrotor_dynamics.py     # Drone dynamics simulation
+│       └── gs_data/                  # Gaussian splatting scene data
 │
 ├── controller/
 │   ├── waypoint_nav_geometric.py     # Main navigation script
@@ -253,13 +266,17 @@ GRaD_Dynamic_onboard/
 │   └── geometric_controller.py       # SE(3) controller
 │
 ├── trajectory/
-│   └── bspline_trajectory.py         # B-spline trajectory generation
+│   ├── bspline_trajectory.py         # B-spline trajectory generation
+│   └── min_snap.py                   # Min-snap trajectory optimization
 │
-├── envs/
-│   └── drone_env.py                  # Simulation environment
+├── utils/
+│   ├── traj_planner_global.py        # A* path planner
+│   ├── gs_local.py                   # Gaussian splatting renderer
+│   ├── point_cloud_util.py           # Point cloud utilities
+│   └── rotation.py                   # Rotation utilities
 │
-└── utils/
-    └── traj_planner_global.py        # A* path planner
+└── checkpoints/
+    └── vel_net_imu_fusion/           # Pretrained vel_net (84-dim)
 ```
 
 ---
