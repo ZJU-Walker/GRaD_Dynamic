@@ -178,6 +178,16 @@ class GradNav:
         self.critic_optimizer = torch.optim.AdamW(self.critic.parameters(), betas = cfg['params']['config']['betas'], lr = self.critic_lr, weight_decay=5e-3)
         self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), betas = cfg['params']['config']['betas'], lr = self.vae_lr, weight_decay=1e-2)
 
+        # vel_net fine-tuning setup
+        self.vel_net_cfg = vel_net_cfg if vel_net_cfg is not None else {}
+        self.vel_net_finetune = self.vel_net_cfg.get('finetune', False)
+        self.vel_net_finetune_start_iter = self.vel_net_cfg.get('finetune_start_iter', 200)
+        self.vel_net_lr = float(self.vel_net_cfg.get('learning_rate', 1e-4))
+        self.init_vel_net_lr = self.vel_net_lr
+        self.vel_net_optimizer = None  # Will be created when fine-tuning starts
+        self.vel_net_finetuning_started = False
+        self.vel_net_loss = 0.0
+
         # replay buffer
         self.obs_buf = torch.zeros((self.steps_num, self.num_envs, self.num_obs), dtype = torch.float32, device = self.device)
         self.privilege_obs_buf = torch.zeros((self.steps_num, self.num_envs, self.num_privilege_obs), dtype = torch.float32, device = self.device)
@@ -194,6 +204,14 @@ class GradNav:
             ckpt_dir = os.path.dirname(ckpt_path)
             self.load(cfg['params']['general']['checkpoint'])
             print_info(f'actor critic networks recovered from {ckpt_path}')
+
+            # CRITICAL: Re-create optimizers after loading checkpoint
+            # The original optimizers were created with the old (randomly initialized) parameters
+            # After load(), self.actor/critic/vae are NEW objects, so we need new optimizers
+            self.actor_optimizer = torch.optim.AdamW(self.actor.parameters(), betas = cfg['params']['config']['betas'], lr = self.actor_lr, weight_decay=5e-3)
+            self.critic_optimizer = torch.optim.AdamW(self.critic.parameters(), betas = cfg['params']['config']['betas'], lr = self.critic_lr, weight_decay=5e-3)
+            self.vae_optimizer = torch.optim.AdamW(self.vae.parameters(), betas = cfg['params']['config']['betas'], lr = self.vae_lr, weight_decay=1e-2)
+            print_info('Optimizers re-created after checkpoint loading')
 
         # for kl divergence computing
         self.old_mus = torch.zeros((self.steps_num, self.num_envs, self.num_actions), dtype = torch.float32, device = self.device)
@@ -412,6 +430,49 @@ class GradNav:
         self.vae_optimizer.step()
         self.time_report.end_timer("VAE training")
 
+    def start_vel_net_finetuning(self):
+        """Start vel_net fine-tuning by enabling gradients and creating optimizer."""
+        if self.vel_net_finetuning_started:
+            return
+
+        if not hasattr(self.env, 'vel_net_enabled') or not self.env.vel_net_enabled:
+            print("[vel_net] Cannot start fine-tuning: vel_net not enabled in environment")
+            return
+
+        # Enable fine-tuning in environment (unfreezes parameters)
+        self.env.enable_vel_net_finetuning()
+
+        # Create optimizer for vel_net parameters
+        trainable_params = self.env.get_vel_net_trainable_params()
+        if len(trainable_params) > 0:
+            self.vel_net_optimizer = torch.optim.AdamW(
+                trainable_params,
+                betas=[0.7, 0.95],
+                lr=self.vel_net_lr,
+                weight_decay=1e-4
+            )
+            self.vel_net_finetuning_started = True
+            print(f"[vel_net] Fine-tuning started at iter {self.iter_count} with lr={self.vel_net_lr}")
+        else:
+            print("[vel_net] Warning: No trainable parameters found")
+
+    def vel_net_update(self):
+        """Update vel_net with supervised loss using buffered rollout data."""
+        if not self.vel_net_finetuning_started or self.vel_net_optimizer is None:
+            return 0.0
+
+        self.vel_net_optimizer.zero_grad()
+
+        # Compute loss with fresh forward pass through vel_net
+        vel_net_loss = self.env.compute_vel_net_loss()
+
+        if vel_net_loss.item() > 0:
+            vel_net_loss.backward()
+            nn.utils.clip_grad_norm_(self.env.get_vel_net_trainable_params(), self.grad_norm)
+            self.vel_net_optimizer.step()
+
+        return vel_net_loss.item()
+
     def compute_vae_loss(self, obs, vel_obs, history_obs, done):
         self.time_report.start_timer("VAE training")
         vae_loss_dict = self.vae.loss_fn(history_obs.clone().detach(), obs.clone().detach())
@@ -555,8 +616,8 @@ class GradNav:
                 self.max_grad, self.mean_grad = tu.calculate_max_mean_gradient(self.actor.parameters())
                 if self.truncate_grad:
                     clip_grad_norm_(self.actor.parameters(), self.grad_norm)
-                self.grad_norm_after_clip = tu.grad_norm(self.actor.parameters()) 
-                
+                self.grad_norm_after_clip = tu.grad_norm(self.actor.parameters())
+
                 # sanity check
                 if torch.isnan(self.grad_norm_before_clip) or self.grad_norm_before_clip > 1000000.:
                     print('NaN gradient')
@@ -594,6 +655,12 @@ class GradNav:
         # main training process
         for epoch in range(self.max_epochs):
             time_start_epoch = time.time()
+
+            # Check if we should start vel_net fine-tuning
+            if self.vel_net_finetune and not self.vel_net_finetuning_started:
+                if self.iter_count >= self.vel_net_finetune_start_iter:
+                    self.start_vel_net_finetuning()
+
             # Multi gate training process
             if self.multi_gate:
                 if (epoch+1) % self.gate_change_time == 0:
@@ -618,6 +685,11 @@ class GradNav:
                 vae_lr = (1e-5 - self.vae_lr) * float(epoch / self.max_epochs) + self.vae_lr
                 for param_group in self.vae_optimizer.param_groups:
                     param_group['lr'] = vae_lr
+                # vel_net lr schedule (if fine-tuning)
+                if self.vel_net_finetuning_started and self.vel_net_optimizer is not None:
+                    vel_net_lr = (1e-5 - self.init_vel_net_lr) * float(epoch / self.max_epochs) + self.init_vel_net_lr
+                    for param_group in self.vel_net_optimizer.param_groups:
+                        param_group['lr'] = vel_net_lr
             # learning rate schedule
             elif self.lr_schedule == 'cosine':
                 # Calculate the cosine schedule
@@ -631,6 +703,11 @@ class GradNav:
                 vae_lr = 1e-5 + (self.vae_lr - 1e-5) * 0.5 * (1 + math.cos(math.pi * epoch / self.max_epochs))
                 for param_group in self.vae_optimizer.param_groups:
                     param_group['lr'] = vae_lr
+                # vel_net lr schedule (if fine-tuning)
+                if self.vel_net_finetuning_started and self.vel_net_optimizer is not None:
+                    vel_net_lr = 1e-5 + (self.init_vel_net_lr - 1e-5) * 0.5 * (1 + math.cos(math.pi * epoch / self.max_epochs))
+                    for param_group in self.vel_net_optimizer.param_groups:
+                        param_group['lr'] = vel_net_lr
             else:
                 lr = self.actor_lr
 
@@ -639,6 +716,10 @@ class GradNav:
             self.time_report.start_timer("actor training")
             self.actor_optimizer.step(actor_closure).detach().item()
             self.time_report.end_timer("actor training")
+
+            # train vel_net (after actor, using buffered rollout data)
+            if self.vel_net_finetuning_started:
+                self.vel_net_loss = self.vel_net_update()
 
             # train critic
             # prepare dataset
@@ -695,8 +776,9 @@ class GradNav:
                 mean_policy_discounted_loss = np.inf
                 mean_episode_length = 0
 
-            print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, vae loss {:.2f}, ep len {:.1f}, fps total {:.2f}, value loss {:.2f}, grad norm before clip {:.2f}, grad norm after clip {:.2f}'.format(\
-                    self.iter_count, mean_policy_loss, mean_policy_discounted_loss, self.vae_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss, self.grad_norm_before_clip, self.grad_norm_after_clip))
+            vel_net_status = f", vel_net loss {self.vel_net_loss:.4f}" if self.vel_net_finetuning_started else ""
+            print('iter {}: ep loss {:.2f}, ep discounted loss {:.2f}, vae loss {:.2f}, ep len {:.1f}, fps total {:.2f}, value loss {:.2f}, grad norm before clip {:.2f}, grad norm after clip {:.2f}{}'.format(\
+                    self.iter_count, mean_policy_loss, mean_policy_discounted_loss, self.vae_loss, mean_episode_length, self.steps_num * self.num_envs / (time_end_epoch - time_start_epoch), self.value_loss, self.grad_norm_before_clip, self.grad_norm_after_clip, vel_net_status))
 
             # self.writer.flush()
         
@@ -715,15 +797,19 @@ class GradNav:
             # update wandb
             wandb_record_loss = mean_policy_loss
             if self.wandb_start:
-                wandb.log({"actor loss": wandb_record_loss, 
-                        "VAE_loss": self.vae_loss,
-                        "recons_loss": self.mean_recons_loss,
-                        "kld_loss": self.mean_kld_loss,
-                        "episode_length": mean_episode_length,
-                        "max_grad":self.max_grad,
-                            "mean_grad": self.mean_grad,
-                            "learning rate": actor_lr
-                        })
+                wandb_dict = {
+                    "actor loss": wandb_record_loss,
+                    "VAE_loss": self.vae_loss,
+                    "recons_loss": self.mean_recons_loss,
+                    "kld_loss": self.mean_kld_loss,
+                    "episode_length": mean_episode_length,
+                    "max_grad": self.max_grad,
+                    "mean_grad": self.mean_grad,
+                    "learning rate": actor_lr
+                }
+                if self.vel_net_finetuning_started:
+                    wandb_dict["vel_net_loss"] = self.vel_net_loss
+                wandb.log(wandb_dict)
 
         self.time_report.end_timer("algorithm")
         self.time_report.report()
@@ -746,7 +832,8 @@ class GradNav:
     def save(self, filename = None):
         if filename is None:
             filename = 'best_policy'
-        torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.env.visual_net], os.path.join(self.log_dir, "{}.pt".format(filename)))
+        # Save privilege_obs_rms as well for proper training resumption
+        torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.env.visual_net, self.privilege_obs_rms], os.path.join(self.log_dir, "{}.pt".format(filename)))
 
     def load(self, path):
         print(path)
@@ -757,4 +844,10 @@ class GradNav:
         self.obs_rms = checkpoint[3].to(self.device)
         self.vae = checkpoint[4].to(self.device)
         self.env.visual_net = checkpoint[5].to(self.device)
+        # Load privilege_obs_rms if available (backwards compatible with old checkpoints)
+        if len(checkpoint) > 6 and checkpoint[6] is not None:
+            self.privilege_obs_rms = checkpoint[6].to(self.device)
+            print_info(f"privilege_obs_rms loaded from checkpoint")
+        else:
+            print_info(f"Warning: privilege_obs_rms not in checkpoint, using freshly initialized")
         print_info(f"all nets have been loaded")
