@@ -9,6 +9,11 @@ params:
     checkpoint_path: "/home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/vel_net_imu_fusion/best.pt"
     enabled: true
     eval_compare: true
+    # Fine-tuning settings
+    finetune: true
+    finetune_start_iter: 1
+    learning_rate: 1e-4
+    finetune_encoder: true  # Also fine-tune DualEncoder FC layers
 
   network:
     actor: ActorStochasticMLP
