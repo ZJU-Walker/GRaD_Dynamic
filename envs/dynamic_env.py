@@ -8,6 +8,7 @@ Extends ExpertDroneEnv with:
 
 import torch
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 from envs.expert_env import ExpertDroneEnv
 from envs.dynamic_utils import (
@@ -19,6 +20,50 @@ from envs.dynamic_utils import (
     SinusoidalPattern,
     TrajectoryPattern,
 )
+
+
+def get_T_world_to_camera(pos, quat_xyzw, device):
+    """
+    Compute 4x4 transformation matrix from world to camera frame.
+    Accounts for GS coordinate flip (Y and Z negated).
+
+    From test_dynamic_obstacle.py - this is the correct transformation.
+    """
+    # Apply GS coordinate flip to position
+    gs_pos = pos.detach().cpu().numpy().copy()
+    gs_pos[1] = -gs_pos[1]
+    gs_pos[2] = -gs_pos[2]
+
+    # Convert quaternion to rotation matrix
+    quat_np = quat_xyzw.detach().cpu().numpy()
+    R_world_to_drone = R.from_quat(quat_np).as_matrix()
+
+    # Apply coordinate flip to rotation
+    flip_matrix = np.array([
+        [1, 0, 0],
+        [0, -1, 0],
+        [0, 0, -1]
+    ])
+    R_world_to_drone_gs = R_world_to_drone @ flip_matrix
+
+    # Drone to camera rotation
+    R_drone_to_camera = np.array([
+        [0, 0, 1],
+        [-1, 0, 0],
+        [0, -1, 0]
+    ])
+
+    R_world_to_camera = R_world_to_drone_gs @ R_drone_to_camera
+
+    # Build 4x4 transformation matrix
+    rotation_part = R_world_to_camera.T
+    translation_part = -rotation_part @ gs_pos
+
+    T = np.eye(4)
+    T[:3, :3] = rotation_part
+    T[:3, 3] = translation_part
+
+    return torch.tensor(T, device=device, dtype=torch.float32).unsqueeze(0)
 
 
 class DynamicDroneEnv(ExpertDroneEnv):
@@ -106,14 +151,32 @@ class DynamicDroneEnv(ExpertDroneEnv):
               f"num_trajectory_objects={len(self.trajectory_objects)}")
 
     def _spawn_dynamic_objects(self, env_ids: torch.Tensor):
-        """Spawn dynamic objects in specified environments based on config."""
+        """Spawn dynamic objects in specified environments based on config.
+
+        Supports sphere, box, and cylinder object types with full parameter support.
+        """
+
         # Reset objects in these environments first
         self.dynamic_manager.reset_env(env_ids)
 
         # Spawn each configured object
         for obj_cfg in self.trajectory_objects:
             obj_type = obj_cfg.get('type', 'sphere')
+
+            # Generic radius (for spheres)
             radius = obj_cfg.get('radius', 0.5)
+
+            # Cylinder parameters
+            cylinder_radius = obj_cfg.get('cylinder_radius', None)
+            cylinder_height = obj_cfg.get('cylinder_height', None)
+            cylinder_axis = obj_cfg.get('cylinder_axis', 2)
+            cylinder_rotation = obj_cfg.get('cylinder_rotation', None)
+
+            # Box parameters
+            box_size = obj_cfg.get('box_size', None)
+            box_rotation = obj_cfg.get('box_rotation', None)
+
+            # Trajectory file
             trajectory_file = obj_cfg.get('trajectory', None)
 
             for env_id in env_ids:
@@ -127,41 +190,44 @@ class DynamicDroneEnv(ExpertDroneEnv):
                             loop=obj_cfg.get('loop', True),
                             device=self.device,
                         )
-
                         # Get initial position from trajectory
                         init_pos = pattern.get_position(0.0)
-
-                        # Spawn object with trajectory
-                        self.dynamic_manager.spawn_object(
-                            env_id=env_id_int,
-                            position=init_pos,
-                            velocity=torch.zeros(3, device=self.device),
-                            radius=radius,
-                            pattern=pattern,
-                            obj_type=obj_type,
-                        )
                     except Exception as e:
                         print(f"[DynamicDroneEnv] Failed to load trajectory {trajectory_file}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
                 else:
                     # Static position from config
-                    position = torch.tensor(
+                    init_pos = torch.tensor(
                         obj_cfg.get('position', [0, 0, 1]),
                         device=self.device,
                         dtype=torch.float32
                     )
-                    velocity = torch.tensor(
-                        obj_cfg.get('velocity', [0, 0, 0]),
-                        device=self.device,
-                        dtype=torch.float32
-                    )
+                    pattern = None
 
-                    self.dynamic_manager.spawn_object(
-                        env_id=env_id_int,
-                        position=position,
-                        velocity=velocity,
-                        radius=radius,
-                        obj_type=obj_type,
-                    )
+                # Get velocity from config (default zeros)
+                velocity = torch.tensor(
+                    obj_cfg.get('velocity', [0, 0, 0]),
+                    device=self.device,
+                    dtype=torch.float32
+                )
+
+                # Spawn object with all parameters
+                self.dynamic_manager.spawn_object(
+                    env_id=env_id_int,
+                    position=init_pos,
+                    velocity=velocity,
+                    radius=radius,
+                    pattern=pattern,
+                    obj_type=obj_type,
+                    cylinder_radius=cylinder_radius,
+                    cylinder_height=cylinder_height,
+                    cylinder_axis=cylinder_axis,
+                    cylinder_rotation=cylinder_rotation,
+                    box_size=box_size,
+                    box_rotation=box_rotation,
+                )
 
     def _update_dynamic_objects(self):
         """Update dynamic object positions."""
@@ -181,14 +247,17 @@ class DynamicDroneEnv(ExpertDroneEnv):
 
     def reset(self, env_ids=None, force_reset=True):
         """Reset environments and spawn dynamic objects."""
-        # Call parent reset
-        obs = super().reset(env_ids, force_reset)
-
-        # Spawn dynamic objects
+        # Spawn dynamic objects BEFORE parent reset
+        # (because parent reset calls calculateObservations -> process_GS_data)
         if self.use_dynamic_objects:
             if env_ids is None:
-                env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
-            self._spawn_dynamic_objects(env_ids)
+                spawn_env_ids = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
+            else:
+                spawn_env_ids = env_ids
+            self._spawn_dynamic_objects(spawn_env_ids)
+
+        # Call parent reset (this will call calculateObservations -> process_GS_data)
+        obs = super().reset(env_ids, force_reset)
 
         return obs
 
@@ -213,11 +282,26 @@ class DynamicDroneEnv(ExpertDroneEnv):
         super().process_GS_data(depth_list, rgb_img)
 
         # Inject dynamic objects into depth and RGB
+        # Using camera_poses approach like original drone_dynamic_expert.py
         if self.use_dynamic_objects:
-            # Get camera poses for augmentation
-            camera_poses = self._get_camera_poses()
+            # Get drone state
+            torso_pos = self.state_joint_q[:, 0:3]
+            torso_quat = self.state_joint_q[:, 3:7]  # (x, y, z, w)
 
-            # Inject objects
+            # Convert drone pose to camera pose for each environment
+            # camera_poses format: (B, 7) with [x, y, z, qx, qy, qz, qw]
+            camera_poses_list = []
+            for i in range(self.num_envs):
+                cam_pos, cam_quat = self._get_camera_pose_from_torso(
+                    torso_pos[i], torso_quat[i]
+                )
+                camera_pose = torch.cat([cam_pos, cam_quat])  # (7,)
+                camera_poses_list.append(camera_pose)
+            camera_poses = torch.stack(camera_poses_list, dim=0)  # (B, 7)
+
+            # Inject objects using camera_poses
+            # NOTE: Object positions stay in world frame - no flipping needed!
+            # The world_to_camera_transform in DepthAugmentor handles the transformation
             augmented_depth, augmented_rgb = self.depth_augmentor.inject_objects_with_rgb(
                 depth_maps=depth_list,
                 rgb_images=rgb_img,
@@ -230,28 +314,75 @@ class DynamicDroneEnv(ExpertDroneEnv):
             self.augmented_depth = augmented_depth
             self.augmented_rgb = augmented_rgb
 
+            # # Debug: collect frames for video
+            # if not hasattr(self, '_debug_frames'):
+            #     self._debug_frames = []
+            #     self._debug_frame_count = 0
+
+            # # Save every frame (keep as RGB for render_and_save)
+            # rgb_np = augmented_rgb[0].detach().cpu().numpy()
+            # frame = (rgb_np * 255).astype('uint8')
+            # self._debug_frames.append(frame)
+
+            # self._debug_frame_count += 1
+
+            # # Save video after 30 frames (quick test)
+            # if len(self._debug_frames) >= 30:
+            #     print(f"[DEBUG] Saving video with {len(self._debug_frames)} frames...")
+            #     video_path = '/home/irislab/ke/GRaD_Dynamic_onboard/debug_dynamic_cylinder.mp4'
+            #     from controller.nav_helpers import render_and_save
+            #     render_and_save(self._debug_frames, video_path, fps=25)
+            #     print(f"[DEBUG] Video saved to {video_path}")
+            #     assert False, f"Debug video saved to {video_path} - stopping to verify"
+            # # debug code for veryfying dynamic support
+
             # Re-process visual features with augmented data
             self._update_visual_features(augmented_depth, augmented_rgb)
 
-    def _get_camera_poses(self):
-        """Get camera poses for all environments.
-
-        Returns:
-            camera_poses: (num_envs, 7) tensor with [x, y, z, qx, qy, qz, qw]
+    def _get_camera_pose_from_torso(self, torso_pos, torso_quat):
         """
-        # Get drone state
-        torso_pos = self.state_joint_q[:, 0:3]
-        torso_quat = self.state_joint_q[:, 3:7]  # (x, y, z, w)
+        Transform torso/drone pose to camera pose.
+        From original drone_dynamic_expert.py.
 
-        # Apply GS coordinate transform (same as in calculateObservations)
-        gs_pos = torso_pos + self.gs_origin_offset
-        gs_pos[:, 1] = -gs_pos[:, 1]
-        gs_pos[:, 2] = -gs_pos[:, 2]
+        Drone/World frame: X forward, Y left, Z up
+        Camera frame: X right, Y down, Z forward
+        """
+        # Camera position is the same as drone position (no offset)
+        camera_pos = torso_pos.clone()
 
-        # Combine into camera pose
-        camera_poses = torch.cat([gs_pos, torso_quat], dim=-1)
+        # Apply drone-to-camera rotation transformation
+        quat_np = torso_quat.detach().cpu().numpy()
+        R_drone = R.from_quat(quat_np).as_matrix()
+        R_drone = torch.from_numpy(R_drone).to(torso_quat.device).float()
 
-        return camera_poses
+        # Rotation matrices for drone-to-camera transformation
+        sin90 = 1.0
+        cos90 = 0.0
+        R_90_y = torch.tensor([
+            [cos90, 0, sin90],
+            [0, 1, 0],
+            [-sin90, 0, cos90]
+        ], dtype=torch.float32, device=torso_quat.device)
+
+        sin90 = -1.0
+        cos90 = 0.0
+        R_neg90_z = torch.tensor([
+            [cos90, -sin90, 0],
+            [sin90, cos90, 0],
+            [0, 0, 1]
+        ], dtype=torch.float32, device=torso_quat.device)
+
+        # Apply transformation to get camera orientation in world frame
+        # R_camera = R_drone.T @ R_90_y @ R_neg90_z TODO
+        R_camera = R_drone @ R_90_y @ R_neg90_z
+
+        # Convert rotation matrix back to quaternion
+        R_camera_np = R_camera.detach().cpu().numpy()
+        r_camera = R.from_matrix(R_camera_np)
+        camera_quat_np = r_camera.as_quat()  # [x,y,z,w] format
+        camera_quat = torch.from_numpy(camera_quat_np).to(torso_quat.device).float()
+
+        return camera_pos, camera_quat
 
     def _update_visual_features(self, depth_list, rgb_img):
         """Update visual features with augmented images."""
