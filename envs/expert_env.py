@@ -359,7 +359,139 @@ class ExpertDroneEnv(SimpleDroneEnv):
         self.gt_vel_history = []
         self.pred_vel_history = []
 
+        # Buffer for vel_net training (stores data from rollout)
+        self.vel_net_train_buffer = {
+            'obs': [],      # vel_net observations
+            'gt_vel': [],   # GT velocities
+            'vel_physics': [],  # Physics baselines
+        }
+
+        # Fine-tuning config
+        self.vel_net_finetune = self.vel_net_cfg.get('finetune', False)
+        self.vel_net_finetune_start_iter = self.vel_net_cfg.get('finetune_start_iter', 200)
+        self.vel_net_lr = self.vel_net_cfg.get('learning_rate', 1e-4)
+        self.vel_net_finetune_encoder = self.vel_net_cfg.get('finetune_encoder', True)
+        self.vel_net_finetuning_active = False  # Will be set to True when fine-tuning starts
+
         print(f"[vel_net] Initialized: num_obs={num_obs}, hidden_dim={hidden_dim}, dt={dt:.4f}")
+        if self.vel_net_finetune:
+            print(f"[vel_net] Fine-tuning enabled: start_iter={self.vel_net_finetune_start_iter}, lr={self.vel_net_lr}")
+
+    def enable_vel_net_finetuning(self):
+        """Enable fine-tuning by unfreezing vel_net and optionally DualEncoder."""
+        if not self.vel_net_enabled or self.vel_net is None:
+            return
+
+        if self.vel_net_finetuning_active:
+            return  # Already enabled
+
+        print("[vel_net] Enabling fine-tuning...")
+
+        # Unfreeze vel_net parameters
+        for param in self.vel_net.parameters():
+            param.requires_grad = True
+        self.vel_net.train()
+
+        # Optionally unfreeze DualEncoder FC layers (backbone stays frozen)
+        if self.vel_net_finetune_encoder and self.dual_encoder is not None:
+            # Unfreeze only FC layers, not backbone
+            for param in self.dual_encoder.rgb_encoder.fc.parameters():
+                param.requires_grad = True
+            for param in self.dual_encoder.depth_encoder.fc.parameters():
+                param.requires_grad = True
+            # Keep backbone frozen
+            for param in self.dual_encoder.rgb_encoder.features.parameters():
+                param.requires_grad = False
+            for param in self.dual_encoder.depth_encoder.features.parameters():
+                param.requires_grad = False
+
+        self.vel_net_finetuning_active = True
+        print(f"[vel_net] Fine-tuning active. Trainable params: {self.count_vel_net_trainable_params()}")
+
+    def get_vel_net_trainable_params(self):
+        """Get trainable parameters for vel_net optimizer."""
+        params = []
+        if self.vel_net is not None:
+            params.extend([p for p in self.vel_net.parameters() if p.requires_grad])
+        if self.vel_net_finetune_encoder and self.dual_encoder is not None:
+            params.extend([p for p in self.dual_encoder.rgb_encoder.fc.parameters() if p.requires_grad])
+            params.extend([p for p in self.dual_encoder.depth_encoder.fc.parameters() if p.requires_grad])
+        return params
+
+    def count_vel_net_trainable_params(self):
+        """Count trainable parameters in vel_net and encoder."""
+        return sum(p.numel() for p in self.get_vel_net_trainable_params())
+
+    def compute_vel_net_loss(self):
+        """
+        Compute vel_net supervised loss using buffered data from rollout.
+        Does a fresh forward pass through vel_net with gradients enabled.
+
+        Following the original trainer.py approach:
+        - Target correction is computed using GT velocity for physics baseline (for stability)
+        - Model input observation can contain predicted prev_vel (from rollout)
+
+        Returns:
+            loss: Scalar tensor for backpropagation
+        """
+        if not self.vel_net_finetuning_active or self.vel_net is None:
+            return torch.tensor(0.0, device=self.device)
+
+        # Check if buffer has data
+        if len(self.vel_net_train_buffer['obs']) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        # Stack buffered data
+        obs_batch = torch.stack(self.vel_net_train_buffer['obs'], dim=0)  # (T, N, 84)
+        gt_vel_batch = torch.stack(self.vel_net_train_buffer['gt_vel'], dim=0)  # (T, N, 3)
+
+        T, N, _ = obs_batch.shape
+
+        # Reset vel_net hidden state for fresh forward pass
+        self.vel_net.reset_hidden_state(N)
+
+        total_loss = torch.tensor(0.0, device=self.device)
+
+        # Sequential forward pass with gradients
+        for t in range(T):
+            obs_t = obs_batch[t]  # (N, 84)
+            gt_vel_t = gt_vel_batch[t]  # (N, 3)
+
+            # Get acceleration from obs (last 3 dims)
+            accel_t = obs_t[:, 81:84]
+
+            # Forward through vel_net (with gradients)
+            correction_mu, _ = self.vel_net.encode_step(obs_t)
+
+            # For TARGET: use GT velocity for physics baseline (for stable training)
+            # This follows the original trainer.py approach
+            if t == 0:
+                # First step: use zeros as GT prev_vel
+                gt_prev_vel = torch.zeros(N, 3, device=self.device)
+            else:
+                # Use GT velocity from previous step
+                gt_prev_vel = gt_vel_batch[t - 1]
+
+            # Physics baseline using GT prev_vel
+            vel_physics = gt_prev_vel + accel_t * self.vel_net.dt
+
+            # Target correction = gt_vel - vel_physics (using GT for stability)
+            correction_gt_raw = gt_vel_t - vel_physics
+
+            # Normalize target
+            correction_gt_norm = (correction_gt_raw - self.delta_mean) / (self.delta_std + 1e-8)
+
+            # MSE loss
+            loss_t = torch.nn.functional.mse_loss(correction_mu, correction_gt_norm.detach())
+            total_loss = total_loss + loss_t
+
+        # Average loss over time steps
+        avg_loss = total_loss / T
+
+        # Clear buffer after computing loss
+        self.vel_net_train_buffer = {'obs': [], 'gt_vel': [], 'vel_physics': []}
+
+        return avg_loss
 
     def _save_vel_comparison_plot(self):
         """Save velocity comparison plot (GT vs vel_net predicted) during evaluation."""
@@ -426,42 +558,50 @@ class ExpertDroneEnv(SimpleDroneEnv):
             lin_vel: Ground truth linear velocity (N, 3) - used for tracking
             lin_acceleration: Linear acceleration (N, 3) - used as IMU input
         """
+        # Convert quaternion to rot6d (detach to avoid sharing graph with actor)
+        rot6d = quaternion_to_rot6d(torso_quat.detach())  # (N, 6)
+
+        # Normalize previous predicted velocity for input
+        prev_vel_normalized = (self.pred_vel_prev - self.vel_mean) / (self.vel_std + 1e-8)
+
+        # Build vel_net observation (84 dims)
+        # Detach inputs to ensure vel_net has its own computation graph separate from actor
+        self.vel_net_obs = build_vel_observation(
+            rot6d=rot6d,                                    # 0:6
+            action=self.actions.detach(),                   # 6:10
+            prev_action=self.prev_actions.detach(),         # 10:14
+            prev_vel=prev_vel_normalized,                   # 14:17 (normalized)
+            rgb_feat=self.rgb_feat_vel.detach(),            # 17:49
+            depth_feat=self.depth_feat_vel.detach(),        # 49:81
+            accel=lin_acceleration.detach(),                # 81:84 (IMU)
+        )
+
+        # Store data for vel_net training (if fine-tuning enabled)
+        if self.vel_net_finetuning_active:
+            self.vel_net_train_buffer['obs'].append(self.vel_net_obs.detach().clone())
+            self.vel_net_train_buffer['gt_vel'].append(lin_vel.detach().clone())
+            # vel_physics will be computed fresh during training
+
+        # Run vel_net inference (always without gradients during rollout)
         with torch.no_grad():
-            # Convert quaternion to rot6d
-            rot6d = quaternion_to_rot6d(torso_quat)  # (N, 6)
-
-            # Normalize previous predicted velocity for input
-            prev_vel_normalized = (self.pred_vel_prev - self.vel_mean) / (self.vel_std + 1e-8)
-
-            # Build vel_net observation (84 dims)
-            self.vel_net_obs = build_vel_observation(
-                rot6d=rot6d,                          # 0:6
-                action=self.actions,                   # 6:10
-                prev_action=self.prev_actions,         # 10:14
-                prev_vel=prev_vel_normalized,          # 14:17 (normalized)
-                rgb_feat=self.rgb_feat_vel,            # 17:49
-                depth_feat=self.depth_feat_vel,        # 49:81
-                accel=lin_acceleration,                # 81:84 (IMU)
-            )
-
-            # Run vel_net inference
             correction_mu, _ = self.vel_net.encode_step(self.vel_net_obs)
 
-            # Denormalize correction
-            correction = correction_mu * self.delta_std + self.delta_mean
+        # Denormalize correction
+        correction = correction_mu * self.delta_std + self.delta_mean
 
-            # Physics-informed fusion: vel_pred = prev_vel + accel * dt + correction
-            vel_physics = self.pred_vel_prev + lin_acceleration * self.vel_net.dt
-            self.pred_vel_current = vel_physics + correction
+        # Physics-informed fusion: vel_pred = prev_vel + accel * dt + correction
+        vel_physics = self.pred_vel_prev + lin_acceleration.detach() * self.vel_net.dt
+        self.pred_vel_current = vel_physics + correction
 
-            # Update previous predicted velocity for next step (auto-regressive)
-            self.pred_vel_prev = self.pred_vel_current.clone()
+        # Update previous predicted velocity for next step (auto-regressive)
+        with torch.no_grad():
+            self.pred_vel_prev = self.pred_vel_current.clone().detach()
 
-            # Track velocities for evaluation comparison (only during visualization/eval)
-            if self.visualize and self.vel_net_eval_compare:
-                # Store only first environment's data for plotting
-                self.gt_vel_history.append(lin_vel[0].cpu().numpy().copy())
-                self.pred_vel_history.append(self.pred_vel_current[0].cpu().numpy().copy())
+        # Track velocities for evaluation comparison (only during visualization/eval)
+        if self.visualize and self.vel_net_eval_compare:
+            # Store only first environment's data for plotting
+            self.gt_vel_history.append(lin_vel[0].detach().cpu().numpy().copy())
+            self.pred_vel_history.append(self.pred_vel_current[0].detach().cpu().numpy().copy())
 
     def step(self, actions, vae_info):
         """
@@ -763,6 +903,10 @@ class ExpertDroneEnv(SimpleDroneEnv):
             latent_abalation,                                             # 33:57
         ], dim=-1)
 
+        # vel_net observation and inference (for evaluation comparison)
+        if self.vel_net_enabled and self.vel_net is not None:
+            self._build_vel_net_obs_and_infer(torso_quat, lin_vel, lin_acceleration)
+            
         # Sanity check (lines 676-684)
         if (torch.isnan(self.obs_buf).any() | torch.isinf(self.obs_buf).any()):
             print("obs buf nan")
@@ -773,10 +917,6 @@ class ExpertDroneEnv(SimpleDroneEnv):
         if (torch.isnan(self.vae_obs_buf).any() | torch.isinf(self.vae_obs_buf).any()):
             print("vae obs buf nan")
             self.vae_obs_buf = torch.nan_to_num(self.vae_obs_buf, nan=0.0, posinf=1e3, neginf=-1e3)
-
-        # vel_net observation and inference (for evaluation comparison)
-        if self.vel_net_enabled and self.vel_net is not None:
-            self._build_vel_net_obs_and_infer(torso_quat, lin_vel, lin_acceleration)
 
     def calculateReward(self):
         """
