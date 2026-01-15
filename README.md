@@ -313,3 +313,158 @@ python examples/train_gradnav.py     --cfg examples/cfg/gradnav/drone_test.yaml 
 ```
  python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_test.yaml --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/examples/logs/gradnav_test/gate_mid/gradnav_migration_test2/best_policy.pt  --play --render
  ```
+
+ ## To continue training a gradnav policy:
+ ```
+ python examples/train_gradnav.py \
+      --cfg examples/cfg/gradnav/drone_test.yaml \
+      --logdir checkpoints/grad_nav_velnet_finetune \
+      --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/grad_nav_velnet_finetune/gate_mid/01-12-2026-12-59-50/best_policy.pt \
+      --device cuda:0
+```
+
+---
+
+# Dynamic Obstacle Support
+
+## Overview
+
+The system supports dynamic obstacles (sphere, box, cylinder) that can be injected into depth and RGB images via ray-casting. Objects can follow predefined trajectories or move with various patterns.
+
+## Quick Test
+
+```bash
+# Test with trajectory navigation (0.3 m/s)
+python controller/test_dynamic_obstacle.py --output output/dynamic_test.mp4 --max_steps 3000
+
+# Test with shake motion
+python controller/test_dynamic_obstacle.py --output output/shake_test.mp4 --max_steps 1000
+```
+
+## Components
+
+### 1. DynamicObjectManager
+Manages batched dynamic objects across multiple environments.
+
+```python
+from envs.dynamic_utils import DynamicObjectManager, TrajectoryPattern
+
+manager = DynamicObjectManager(num_envs=1, device='cuda:0', max_objects_per_env=5)
+
+# Spawn sphere with trajectory
+pattern = TrajectoryPattern(trajectory_file='envs/assets/trajectories/human.csv', loop=True, device='cuda:0')
+manager.spawn_object(env_id=0, position=pattern.get_position(0.0),
+                     velocity=torch.zeros(3), radius=0.5, pattern=pattern, obj_type='sphere')
+
+# Update positions each step
+manager.update(dt=0.02)
+```
+
+### 2. DepthAugmentor
+Ray-casting based depth/RGB injection with proper occlusion handling.
+
+```python
+from envs.dynamic_utils import DepthAugmentor
+
+camera_params = {'fx': 128.0, 'fy': 128.0, 'cx': 128.0, 'cy': 72.0, 'width': 256, 'height': 144}
+augmentor = DepthAugmentor(camera_params=camera_params, device='cuda:0')
+
+# Inject objects into images
+augmented_depth, augmented_rgb = augmentor.inject_objects_with_rgb(
+    depth_maps=depth,           # (B, H, W, 1)
+    rgb_images=rgb,             # (B, H, W, 3)
+    T_world_to_camera=T_matrix, # (B, 4, 4) transformation matrix
+    dynamic_manager=manager,
+    use_shading=True
+)
+```
+
+### 3. Movement Patterns
+
+| Pattern | Description |
+|---------|-------------|
+| `LinearPattern` | Move in straight line with velocity |
+| `CircularPattern` | Circular motion around center |
+| `SinusoidalPattern` | Oscillating motion along axis |
+| `RandomWalkPattern` | Random direction changes |
+| `TrajectoryPattern` | Follow CSV trajectory file |
+
+### 4. DynamicDroneEnv
+Environment with built-in dynamic obstacle support.
+
+```yaml
+# examples/cfg/gradnav/drone_dynamic_test.yaml
+params:
+  diff_env:
+    name: DynamicDroneEnv
+
+  dynamic_objects:
+    enabled: true
+    max_objects_per_env: 1
+    collision_threshold: 0.3
+    camera_params:
+      fx: 320.0
+      fy: 320.0
+      cx: 320.0
+      cy: 180.0
+      width: 640
+      height: 360
+    objects:
+      - type: sphere
+        radius: 0.5
+        trajectory: "envs/assets/trajectories/human.csv"
+        loop: true
+```
+
+## Coordinate System Notes
+
+**Important:** GS coordinate system has Y and Z negated vs world frame.
+
+```python
+# Before injection, flip sphere positions to GS frame
+original_positions = manager.positions.clone()
+manager.positions[:, :, 1] = -original_positions[:, :, 1]  # Flip Y
+manager.positions[:, :, 2] = -original_positions[:, :, 2]  # Flip Z
+
+# Inject objects
+augmented_depth, augmented_rgb = augmentor.inject_objects_with_rgb(...)
+
+# Restore original positions
+manager.positions = original_positions
+```
+
+## Camera Transform
+
+Use `T_world_to_camera` 4x4 matrix for correct coordinate handling:
+
+```python
+def get_T_world_to_camera(pos, quat_xyzw, device):
+    # Apply GS coordinate flip to position
+    gs_pos = pos.cpu().numpy().copy()
+    gs_pos[1] = -gs_pos[1]
+    gs_pos[2] = -gs_pos[2]
+
+    # Build rotation matrix with GS flip
+    R_world_to_drone = Rotation.from_quat(quat_xyzw).as_matrix()
+    flip_matrix = np.diag([1, -1, -1])
+    R_world_to_drone_gs = R_world_to_drone @ flip_matrix
+
+    # Drone to camera rotation
+    R_drone_to_camera = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]])
+    R_world_to_camera = R_world_to_drone_gs @ R_drone_to_camera
+
+    # Build 4x4 matrix
+    T = np.eye(4)
+    T[:3, :3] = R_world_to_camera.T
+    T[:3, 3] = -T[:3, :3] @ gs_pos
+
+    return torch.tensor(T, device=device, dtype=torch.float32).unsqueeze(0)
+```
+
+## Supported Object Types
+
+| Type | Parameters |
+|------|------------|
+| `sphere` | `radius` |
+| `box` | `box_size` (3D), `box_rotation` (quaternion) |
+| `cylinder` | `cylinder_radius`, `cylinder_height`, `cylinder_axis` (0/1/2) |
