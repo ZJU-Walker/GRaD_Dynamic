@@ -143,12 +143,13 @@ class DynamicDroneEnv(ExpertDroneEnv):
         # Trajectory config - list of objects to spawn
         self.trajectory_objects = cfg.get('objects', [])
 
-        # Collision tracking (for future reward integration)
+        # Collision tracking for reward integration
         self.collision_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.min_dist_to_dynamic = torch.full((self.num_envs,), float('inf'), device=self.device)
 
         print(f"[DynamicDroneEnv] Initialized with max_objects={max_objects}, "
-              f"num_trajectory_objects={len(self.trajectory_objects)}")
+              f"num_trajectory_objects={len(self.trajectory_objects)}, "
+              f"dynamic_reward: threshold={self.cfg.dynamic_obst_threshold}, strength={self.cfg.dynamic_obst_strength}")
 
     def _spawn_dynamic_objects(self, env_ids: torch.Tensor):
         """Spawn dynamic objects in specified environments based on config.
@@ -235,11 +236,12 @@ class DynamicDroneEnv(ExpertDroneEnv):
 
     def _check_dynamic_collisions(self):
         """Check for collisions with dynamic objects."""
-        # Get drone positions
-        drone_pos = self.state_joint_q[:, 0:3]
+        # Get drone positions (detached to avoid gradient flow through dynamic obstacle reward)
+        drone_pos = self.state_joint_q[:, 0:3].detach()
 
-        # Compute distances to dynamic objects
-        self.min_dist_to_dynamic = self.dynamic_manager.get_distances_to_point(drone_pos)
+        # Compute distances to dynamic objects (no gradients needed)
+        with torch.no_grad():
+            self.min_dist_to_dynamic = self.dynamic_manager.get_distances_to_point(drone_pos)
 
         # Check for collisions (distance < 0 means overlap)
         collision_threshold = self.dynamic_objects_cfg.get('collision_threshold', 0.3)
@@ -259,6 +261,20 @@ class DynamicDroneEnv(ExpertDroneEnv):
         # Call parent reset (this will call calculateObservations -> process_GS_data)
         obs = super().reset(env_ids, force_reset)
 
+        # Replace viz_recorder's last frame with augmented images (for correct video output)
+        if self.visualize and self.use_dynamic_objects and hasattr(self, 'augmented_rgb'):
+            from torchvision.transforms import Resize
+            img_transform = Resize((360, 640), antialias=True)
+
+            # Replace RGB frame
+            augmented_rgb_frame = torch.permute(self.augmented_rgb[0], (2, 0, 1))
+            augmented_rgb_transformed = img_transform(augmented_rgb_frame)
+            self.viz_recorder.img_record[-1] = augmented_rgb_transformed
+
+            # Replace depth frame
+            augmented_depth_np = self.augmented_depth.clone().detach().cpu().numpy()
+            self.viz_recorder.depth_record[-1] = augmented_depth_np[0] / 2
+
         return obs
 
     def step(self, actions, vae_info):
@@ -267,14 +283,50 @@ class DynamicDroneEnv(ExpertDroneEnv):
         if self.use_dynamic_objects:
             self._update_dynamic_objects()
 
-        # Call parent step
+        # Call parent step (which calls calculateReward -> _check_dynamic_collisions)
         result = super().step(actions, vae_info)
 
-        # Check collisions (for future reward integration)
+        # Replace viz_recorder's last frame with augmented images (for correct video output)
+        if self.visualize and self.use_dynamic_objects and hasattr(self, 'augmented_rgb'):
+            from torchvision.transforms import Resize
+            img_transform = Resize((360, 640), antialias=True)
+
+            # Replace RGB frame
+            augmented_rgb_frame = torch.permute(self.augmented_rgb[0], (2, 0, 1))
+            augmented_rgb_transformed = img_transform(augmented_rgb_frame)
+            self.viz_recorder.img_record[-1] = augmented_rgb_transformed
+
+            # Replace depth frame
+            augmented_depth_np = self.augmented_depth.clone().detach().cpu().numpy()
+            self.viz_recorder.depth_record[-1] = augmented_depth_np[0] / 2
+
+        return result
+
+    def calculateReward(self):
+        """Calculate rewards including dynamic obstacle reward.
+
+        Extends parent reward with dynamic obstacle avoidance reward.
+        Uses same pattern as static obstacle reward in env_utils/reward.py.
+        """
+        # First check dynamic collisions to update min_dist_to_dynamic
         if self.use_dynamic_objects:
             self._check_dynamic_collisions()
 
-        return result
+        # Call parent reward calculation (static obstacles, waypoints, etc.)
+        super().calculateReward()
+
+        # Add dynamic obstacle reward (similar to static obst_reward pattern)
+        if self.use_dynamic_objects:
+            # Reward proportional to distance when within threshold
+            # Closer = more negative reward (penalty)
+            dynamic_obst_reward = torch.where(
+                self.min_dist_to_dynamic < self.cfg.dynamic_obst_threshold,
+                self.min_dist_to_dynamic * self.cfg.dynamic_obst_strength,
+                torch.zeros_like(self.min_dist_to_dynamic)
+            )
+
+            # Add to reward buffer (reward is negative for obstacles, so this encourages staying far)
+            self.rew_buf = self.rew_buf + dynamic_obst_reward
 
     def process_GS_data(self, depth_list, rgb_img):
         """Process GS data and inject dynamic objects."""
@@ -283,61 +335,94 @@ class DynamicDroneEnv(ExpertDroneEnv):
 
         # Inject dynamic objects into depth and RGB
         # Using camera_poses approach like original drone_dynamic_expert.py
+        # Wrapped in no_grad to avoid unnecessary gradient computation
         if self.use_dynamic_objects:
-            # Get drone state
-            torso_pos = self.state_joint_q[:, 0:3]
-            torso_quat = self.state_joint_q[:, 3:7]  # (x, y, z, w)
+            with torch.no_grad():
+                # Get drone state
+                torso_pos = self.state_joint_q[:, 0:3]
+                torso_quat = self.state_joint_q[:, 3:7]  # (x, y, z, w)
 
-            # Convert drone pose to camera pose for each environment
-            # camera_poses format: (B, 7) with [x, y, z, qx, qy, qz, qw]
-            camera_poses_list = []
-            for i in range(self.num_envs):
-                cam_pos, cam_quat = self._get_camera_pose_from_torso(
-                    torso_pos[i], torso_quat[i]
+                # Convert drone pose to camera pose for each environment
+                # camera_poses format: (B, 7) with [x, y, z, qx, qy, qz, qw]
+                camera_poses_list = []
+                for i in range(self.num_envs):
+                    cam_pos, cam_quat = self._get_camera_pose_from_torso(
+                        torso_pos[i], torso_quat[i]
+                    )
+                    camera_pose = torch.cat([cam_pos, cam_quat])  # (7,)
+                    camera_poses_list.append(camera_pose)
+
+                camera_poses = torch.stack(camera_poses_list, dim=0)  # (B, 7)
+
+                # Inject objects using camera_poses
+                # NOTE: Object positions stay in world frame - no flipping needed!
+                augmented_depth, augmented_rgb = self.depth_augmentor.inject_objects_with_rgb(
+                    depth_maps=depth_list,
+                    rgb_images=rgb_img,
+                    camera_poses=camera_poses,
+                    dynamic_manager=self.dynamic_manager,
+                    use_shading=True,
                 )
-                camera_pose = torch.cat([cam_pos, cam_quat])  # (7,)
-                camera_poses_list.append(camera_pose)
-            camera_poses = torch.stack(camera_poses_list, dim=0)  # (B, 7)
 
-            # Inject objects using camera_poses
-            # NOTE: Object positions stay in world frame - no flipping needed!
-            # The world_to_camera_transform in DepthAugmentor handles the transformation
-            augmented_depth, augmented_rgb = self.depth_augmentor.inject_objects_with_rgb(
-                depth_maps=depth_list,
-                rgb_images=rgb_img,
-                camera_poses=camera_poses,
-                dynamic_manager=self.dynamic_manager,
-                use_shading=True,
-            )
+                # Store augmented data (for visualization if needed)
+                self.augmented_depth = augmented_depth
+                self.augmented_rgb = augmented_rgb
 
-            # Store augmented data (for visualization if needed)
-            self.augmented_depth = augmented_depth
-            self.augmented_rgb = augmented_rgb
-
-            # # Debug: collect frames for video
-            # if not hasattr(self, '_debug_frames'):
-            #     self._debug_frames = []
+            # # Debug: collect frames for video (RGB + Depth)
+            # if not hasattr(self, '_debug_rgb_frames'):
+            #     self._debug_rgb_frames = []
+            #     self._debug_depth_frames = []
             #     self._debug_frame_count = 0
 
-            # # Save every frame (keep as RGB for render_and_save)
+            # # Save RGB frame
             # rgb_np = augmented_rgb[0].detach().cpu().numpy()
-            # frame = (rgb_np * 255).astype('uint8')
-            # self._debug_frames.append(frame)
+            # rgb_frame = (rgb_np * 255).astype('uint8')
+            # self._debug_rgb_frames.append(rgb_frame)
+
+            # # Save Depth frame (normalize to 0-255 for visualization)
+            # depth_np = augmented_depth[0, :, :, 0].detach().cpu().numpy()  # (H, W)
+            # # Clip and normalize depth for visualization (0-10m range)
+            # depth_clipped = np.clip(depth_np, 0, 10)
+            # depth_normalized = (depth_clipped / 10 * 255).astype('uint8')
+            # # Convert to RGB (grayscale -> 3 channel)
+            # depth_frame = np.stack([depth_normalized] * 3, axis=-1)
+            # self._debug_depth_frames.append(depth_frame)
 
             # self._debug_frame_count += 1
 
-            # # Save video after 30 frames (quick test)
-            # if len(self._debug_frames) >= 30:
-            #     print(f"[DEBUG] Saving video with {len(self._debug_frames)} frames...")
-            #     video_path = '/home/irislab/ke/GRaD_Dynamic_onboard/debug_dynamic_cylinder.mp4'
+            # # Save videos after 100 frames
+            # if len(self._debug_rgb_frames) >= 50:
+            #     print(f"[DEBUG] Saving videos with {len(self._debug_rgb_frames)} frames...")
             #     from controller.nav_helpers import render_and_save
-            #     render_and_save(self._debug_frames, video_path, fps=25)
-            #     print(f"[DEBUG] Video saved to {video_path}")
-            #     assert False, f"Debug video saved to {video_path} - stopping to verify"
-            # # debug code for veryfying dynamic support
+
+            #     # Save RGB video
+            #     rgb_path = '/home/irislab/ke/GRaD_Dynamic_onboard/debug_dynamic_rgb.mp4'
+            #     render_and_save(self._debug_rgb_frames, rgb_path, fps=25)
+            #     print(f"[DEBUG] RGB video saved to {rgb_path}")
+
+            #     # Save Depth video
+            #     depth_path = '/home/irislab/ke/GRaD_Dynamic_onboard/debug_dynamic_depth.mp4'
+            #     render_and_save(self._debug_depth_frames, depth_path, fps=25)
+            #     print(f"[DEBUG] Depth video saved to {depth_path}")
+
+            #     assert False, f"Debug videos saved - stopping to verify"
+            # # debug code for verifying dynamic support
 
             # Re-process visual features with augmented data
             self._update_visual_features(augmented_depth, augmented_rgb)
+
+    def _conjugate_quat(self, quat):
+        """
+        Conjugate quaternion tensor [x, y, z, w] -> [x, -y, -z, w]
+        This fixes the handedness mismatch between simulation and rendering.
+        Only negates Y and Z components.
+        """
+        result = quat.clone().detach()
+        result[0] = quat[0]
+        result[1] = -quat[1]
+        result[2] = -quat[2]
+        # result[3] = quat[3]  # w stays the same
+        return result
 
     def _get_camera_pose_from_torso(self, torso_pos, torso_quat):
         """
@@ -348,10 +433,13 @@ class DynamicDroneEnv(ExpertDroneEnv):
         Camera frame: X right, Y down, Z forward
         """
         # Camera position is the same as drone position (no offset)
-        camera_pos = torso_pos.clone()
+        camera_pos = torso_pos.clone().detach()
+
+        # Conjugate quaternion to fix handedness mismatch
+        torso_quat_conj = self._conjugate_quat(torso_quat)
 
         # Apply drone-to-camera rotation transformation
-        quat_np = torso_quat.detach().cpu().numpy()
+        quat_np = torso_quat_conj.detach().cpu().numpy()
         R_drone = R.from_quat(quat_np).as_matrix()
         R_drone = torch.from_numpy(R_drone).to(torso_quat.device).float()
 

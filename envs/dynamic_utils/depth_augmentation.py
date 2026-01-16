@@ -523,7 +523,8 @@ class DepthAugmentor:
                          camera_quat: torch.Tensor = None,
                          T_world_to_camera: torch.Tensor = None,
                          use_shading: bool = True,
-                         debug: bool = False):
+                         debug: bool = False,
+                         env_id: int = 0):
         """Inject a colored sphere into RGB image with shading and occlusion"""
         H, W, C = rgb_image.shape
 
@@ -781,7 +782,7 @@ class DepthAugmentor:
             ], device=device, dtype=torch.float32)
             # Transform cylinder rotation from world to camera frame
             # rot_matrix = R_cam_from_cyl_local (transforms cylinder local → camera)
-            rot_matrix = (rot_matrix @ R_world_to_cam).T
+            rot_matrix = (rot_matrix @ R_world_to_cam)
 
             use_rotation = True
         else:
@@ -975,26 +976,27 @@ class DepthAugmentor:
 
         depth_maps = depth_maps.to(self.device)
         rgb_images = rgb_images.to(self.device)
+
+        augmented_depth = depth_maps.clone()
+        augmented_rgb = rgb_images.clone()
+
         if camera_poses is not None:
             camera_poses = camera_poses.to(self.device)
         if T_world_to_camera is not None:
             T_world_to_camera = T_world_to_camera.to(self.device)
 
-        augmented_depth = depth_maps.clone()
-        augmented_rgb = rgb_images.clone()
-
         sphere_colors = custom_colors if custom_colors else self.default_sphere_colors
 
         for env_id in range(B):
-            # Support both camera_poses and T_world_to_camera
-            if T_world_to_camera is not None:
-                T_matrix = T_world_to_camera[env_id]
-                cam_pos = None
-                cam_quat = None
-            else:
+            # Get camera pose (either from camera_poses or T_world_to_camera)
+            if camera_poses is not None:
                 cam_pos = camera_poses[env_id, :3]
                 cam_quat = camera_poses[env_id, 3:7]
                 T_matrix = None
+            else:
+                cam_pos = None
+                cam_quat = None
+                T_matrix = T_world_to_camera[env_id] if T_world_to_camera is not None else None
 
             depth_2d = augmented_depth[env_id, :, :, 0]
             rgb_2d = augmented_rgb[env_id]
@@ -1029,7 +1031,8 @@ class DepthAugmentor:
                             cam_quat,
                             T_matrix,
                             use_shading,
-                            debug=False
+                            debug=False,
+                            env_id = env_id
                         )
                     elif obj_type == 'box':
                         box_size = dynamic_manager.box_sizes[env_id, obj_idx]
