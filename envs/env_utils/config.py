@@ -64,6 +64,10 @@ class EnvConfig:
     target_height: float = 1.3
     obst_threshold: float = 0.5
 
+    # Dynamic obstacle reward (for DynamicDroneEnv)
+    dynamic_obst_threshold: float = 1   # Distance threshold to apply reward (meters)
+    dynamic_obst_strength: float = 1.0    # Reward multiplier (higher = stronger avoidance)
+
     # ==========================================================================
     # Environment Parameters
     # ==========================================================================
