@@ -1,0 +1,98 @@
+params:
+  diff_env:
+    name: DynamicDroneEnv
+    stochastic_env: True
+    episode_length: 800
+    MM_caching_frequency: 16
+
+  # Dynamic obstacle configuration
+  dynamic_objects:
+    enabled: true
+    max_objects_per_env: 1
+    collision_threshold: 0.1
+    # Reward params: dynamic_obst_threshold, dynamic_obst_strength in env_utils/config.py
+
+    # Camera parameters (must match GS render resolution 0.4)
+    camera_params:
+      fx: 128.0    # 320 * 0.4
+      fy: 128.0    # 320 * 0.4
+      cx: 128.0    # 320 * 0.4
+      cy: 72.0     # 180 * 0.4
+      width: 256   # 640 * 0.4
+      height: 144  # 360 * 0.4
+
+    # List of objects to spawn
+    objects:
+      - type: cylinder
+        cylinder_radius: 0.3       # radius in meters
+        cylinder_height: 1.8       # height in meters (human-like)
+        cylinder_axis: 2           # Z-axis (vertical)
+        cylinder_rotation: [0.0, 0.7071, 0.0, 0.7071]  # 90 deg around X to stand upright
+        trajectory: "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/human.csv"
+        loop: true
+
+  vel_net:
+    checkpoint_path: "/home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/vel_net_imu_fusion/best.pt"
+    enabled: true
+    eval_compare: true
+    finetune: true
+    finetune_start_iter: 1
+    learning_rate: 1e-4
+    finetune_encoder: true
+
+  network:
+    actor: ActorStochasticMLP
+    actor_mlp:
+      units: [256, 128, 64]
+      activation: elu
+
+    critic: CriticMLP
+    critic_mlp:
+      units: [256, 128, 64]
+      activation: elu
+
+  vae:
+    kl_weight: 1.0
+    encoder_units: [256, 256, 256]
+    decoder_units: [32, 64, 128, 256]
+
+  env_hyper:
+    SINGLE_VISUAL_INPUT_SIZE: 16
+    HISTORY_BUFFER_NUM: 5
+    LATENT_VECT_NUM: 24
+
+  config:
+    name: gradnav_dynamic_cylinder
+    map_name: gate_mid
+    actor_learning_rate: 1e-4
+    critic_learning_rate: 1e-4
+    vae_learning_rate: 5e-4
+    lr_schedule: cosine
+    target_critic_alpha: 0.2
+    obs_rms: True
+    ret_rms: False
+    critic_iterations: 16
+    critic_method: td-lambda
+    lambda: 0.95
+    num_batch: 4
+    gamma: 0.99
+    betas: [0.7, 0.95]
+    steps_num: 32
+    grad_norm: 1.0
+    truncate_grads: True
+    num_actors: 64
+    save_interval: 50
+    max_epochs: 2000
+    domain_randomization: True
+    rew_scale: 1.0
+
+    LPF_train: True
+    LPF_val: 0.5
+
+    player:
+      determenistic: True
+      games_num: 1
+      num_actors: 1
+      print_stats: True
+      LPF_eval: True
+      LPF_val: 0.5
