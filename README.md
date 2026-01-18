@@ -314,7 +314,7 @@ python examples/train_gradnav.py     --cfg examples/cfg/gradnav/drone_test.yaml 
  python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_test.yaml --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/examples/logs/gradnav_test/gate_mid/gradnav_migration_test2/best_policy.pt  --play --render
  ```
 
- ## To continue training a gradnav policy:
+ ## To continue training a gradnav policy (with bug potential):
  ```
  python examples/train_gradnav.py \
       --cfg examples/cfg/gradnav/drone_test.yaml \
@@ -322,7 +322,20 @@ python examples/train_gradnav.py     --cfg examples/cfg/gradnav/drone_test.yaml 
       --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/grad_nav_velnet_finetune/gate_mid/01-12-2026-12-59-50/best_policy.pt \
       --device cuda:0
 ```
-
+## To train with dynamic cylinder obstacle
+```
+python examples/train_gradnav_dynamic.py \
+      --cfg examples/cfg/gradnav/drone_dynamic_cylinder.yaml \
+      --logdir checkpoints/gradnav_dynamic_cylinder \
+      --device cuda:0
+```
+## To eval
+```
+python examples/train_gradnav_dynamic.py \
+      --cfg examples/cfg/gradnav/drone_dynamic_sphere.yaml \
+      --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/dynamic_gradnav_cylinder_test_0115/gate_mid/01-15-2026-02-52-33/best_policy.pt \
+      --play --render
+```
 ---
 
 # Dynamic Obstacle Support
