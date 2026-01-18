@@ -1001,7 +1001,8 @@ class DepthAugmentor:
             depth_2d = augmented_depth[env_id, :, :, 0]
             rgb_2d = augmented_rgb[env_id]
 
-            original_depth_2d = depth_maps[env_id, :, :, 0].clone()
+            # Use background depth for occlusion against static scene
+            background_depth = depth_maps[env_id, :, :, 0].clone()
 
             for obj_idx in range(dynamic_manager.max_objects):
                 if dynamic_manager.active[env_id, obj_idx]:
@@ -1012,18 +1013,11 @@ class DepthAugmentor:
                     if obj_type == 'sphere':
                         sphere_radius = dynamic_manager.radii[env_id, obj_idx].item()
 
-                        depth_2d = self.inject_sphere(
-                            depth_2d,
-                            obj_pos,
-                            sphere_radius,
-                            cam_pos,
-                            cam_quat,
-                            T_matrix
-                        )
-
+                        # Inject RGB FIRST (before depth update) so current object can render
+                        # Uses depth_2d which has previous objects but not current one
                         rgb_2d = self.inject_sphere_rgb(
                             rgb_2d,
-                            original_depth_2d,
+                            depth_2d,
                             obj_pos,
                             sphere_radius,
                             obj_color,
@@ -1034,23 +1028,24 @@ class DepthAugmentor:
                             debug=False,
                             env_id = env_id
                         )
-                    elif obj_type == 'box':
-                        box_size = dynamic_manager.box_sizes[env_id, obj_idx]
-                        box_rotation = dynamic_manager.box_rotations[env_id, obj_idx]
 
-                        depth_2d = self.inject_box(
+                        # Then update depth with current object (for next object's occlusion)
+                        depth_2d = self.inject_sphere(
                             depth_2d,
                             obj_pos,
-                            box_size,
-                            box_rotation,
+                            sphere_radius,
                             cam_pos,
                             cam_quat,
                             T_matrix
                         )
+                    elif obj_type == 'box':
+                        box_size = dynamic_manager.box_sizes[env_id, obj_idx]
+                        box_rotation = dynamic_manager.box_rotations[env_id, obj_idx]
 
+                        # Inject RGB FIRST
                         rgb_2d = self.inject_box_rgb(
                             rgb_2d,
-                            original_depth_2d,
+                            depth_2d,
                             obj_pos,
                             box_size,
                             box_rotation,
@@ -1061,6 +1056,17 @@ class DepthAugmentor:
                             use_shading,
                             debug=False
                         )
+
+                        # Then update depth
+                        depth_2d = self.inject_box(
+                            depth_2d,
+                            obj_pos,
+                            box_size,
+                            box_rotation,
+                            cam_pos,
+                            cam_quat,
+                            T_matrix
+                        )
                     elif obj_type == 'cylinder':
                         cylinder_params = dynamic_manager.cylinder_params[env_id, obj_idx]
                         cylinder_radius = cylinder_params[0].item()
@@ -1068,6 +1074,24 @@ class DepthAugmentor:
                         cylinder_axis = int(cylinder_params[2].item())
                         cylinder_rotation = dynamic_manager.cylinder_rotations[env_id, obj_idx]
 
+                        # Inject RGB FIRST
+                        rgb_2d = self.inject_cylinder_rgb(
+                            rgb_2d,
+                            depth_2d,
+                            obj_pos,
+                            cylinder_radius,
+                            cylinder_height,
+                            cylinder_axis,
+                            cylinder_rotation,
+                            obj_color,
+                            cam_pos,
+                            cam_quat,
+                            T_matrix,
+                            use_shading,
+                            debug=False
+                        )
+
+                        # Then update depth
                         depth_2d = self.inject_cylinder(
                             depth_2d,
                             obj_pos,
@@ -1078,22 +1102,6 @@ class DepthAugmentor:
                             cam_pos,
                             cam_quat,
                             T_matrix
-                        )
-
-                        rgb_2d = self.inject_cylinder_rgb(
-                            rgb_2d,
-                            original_depth_2d,
-                            obj_pos,
-                            cylinder_radius,
-                            cylinder_height,
-                            cylinder_axis,
-                            cylinder_rotation,
-                            obj_color,
-                            cam_pos,
-                            cam_quat,
-                            T_matrix,
-                            use_shading,
-                            debug=False
                         )
 
             augmented_depth[env_id, :, :, 0] = depth_2d
