@@ -208,6 +208,7 @@ def save_trajectory_topdown(
     output_path: str,
     pc_offset: np.ndarray = None,
     dt: float = 0.02,
+    actual_trajectory: np.ndarray = None,
 ):
     """
     Save top-down (XY plane), side view (XZ plane), and 3D views comparing A* path and B-spline trajectory.
@@ -219,6 +220,7 @@ def save_trajectory_topdown(
         output_path: Path to save the image
         pc_offset: Offset from point cloud to simulation space
         dt: Time step for sampling trajectory
+        actual_trajectory: Optional actual drone trajectory (in simulation space)
     """
     import matplotlib.pyplot as plt
 
@@ -257,16 +259,19 @@ def save_trajectory_topdown(
     ax1.grid(True, alpha=0.3)
     ax1.axis('equal')
 
-    # Top-right: B-spline trajectory (XY)
+    # Top-right: B-spline trajectory (XY) + actual trajectory
     ax2 = fig.add_subplot(3, 2, 2)
     ax2.plot(astar_points[:, 0], astar_points[:, 1], 'gray', linewidth=1, alpha=0.3, label='A* path')
     ax2.plot(traj_points[:, 0], traj_points[:, 1], 'b-', linewidth=2, label='B-spline')
+    if actual_trajectory is not None:
+        actual_pc = actual_trajectory - pc_offset  # Convert to point cloud space
+        ax2.plot(actual_pc[:, 0], actual_pc[:, 1], 'r--', linewidth=1.5, alpha=0.8, label='Actual')
     ax2.scatter(waypoints_arr[:, 0], waypoints_arr[:, 1], c='orange', s=100, zorder=5, label='Waypoints')
     ax2.scatter(traj_points[0, 0], traj_points[0, 1], c='green', s=200, marker='o', zorder=6, label='Start')
     ax2.scatter(traj_points[-1, 0], traj_points[-1, 1], c='red', s=200, marker='x', zorder=6, label='End')
     ax2.set_xlabel('X (m)')
     ax2.set_ylabel('Y (m)')
-    ax2.set_title('B-Spline Trajectory - Top Down (XY)')
+    ax2.set_title('B-Spline + Actual Trajectory - Top Down (XY)')
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
     ax2.axis('equal')
@@ -286,16 +291,19 @@ def save_trajectory_topdown(
     ax3.grid(True, alpha=0.3)
     ax3.axis('equal')
 
-    # Middle-right: B-spline trajectory (XZ)
+    # Middle-right: B-spline trajectory (XZ) + actual trajectory
     ax4 = fig.add_subplot(3, 2, 4)
     ax4.plot(astar_points[:, 0], astar_points[:, 2], 'gray', linewidth=1, alpha=0.3, label='A* path')
     ax4.plot(traj_points[:, 0], traj_points[:, 2], 'b-', linewidth=2, label='B-spline')
+    if actual_trajectory is not None:
+        actual_pc = actual_trajectory - pc_offset
+        ax4.plot(actual_pc[:, 0], actual_pc[:, 2], 'r--', linewidth=1.5, alpha=0.8, label='Actual')
     ax4.scatter(waypoints_arr[:, 0], waypoints_arr[:, 2], c='orange', s=100, zorder=5, label='Waypoints')
     ax4.scatter(traj_points[0, 0], traj_points[0, 2], c='green', s=200, marker='o', zorder=6, label='Start')
     ax4.scatter(traj_points[-1, 0], traj_points[-1, 2], c='red', s=200, marker='x', zorder=6, label='End')
     ax4.set_xlabel('X (m)')
     ax4.set_ylabel('Z (m)')
-    ax4.set_title('B-Spline Trajectory - Side View (XZ)')
+    ax4.set_title('B-Spline + Actual Trajectory - Side View (XZ)')
     ax4.legend(fontsize=8)
     ax4.grid(True, alpha=0.3)
     ax4.axis('equal')
@@ -314,17 +322,20 @@ def save_trajectory_topdown(
     ax5.set_title('A* Raw Path - 3D View')
     ax5.legend(fontsize=8)
 
-    # Bottom-right: B-spline trajectory (3D)
+    # Bottom-right: B-spline trajectory (3D) + actual trajectory
     ax6 = fig.add_subplot(3, 2, 6, projection='3d')
     ax6.plot(astar_points[:, 0], astar_points[:, 1], astar_points[:, 2], 'gray', linewidth=1, alpha=0.3, label='A* path')
     ax6.plot(traj_points[:, 0], traj_points[:, 1], traj_points[:, 2], 'b-', linewidth=2, label='B-spline')
+    if actual_trajectory is not None:
+        actual_pc = actual_trajectory - pc_offset
+        ax6.plot(actual_pc[:, 0], actual_pc[:, 1], actual_pc[:, 2], 'r--', linewidth=1.5, alpha=0.8, label='Actual')
     ax6.scatter(waypoints_arr[:, 0], waypoints_arr[:, 1], waypoints_arr[:, 2], c='orange', s=100, label='Waypoints')
     ax6.scatter(traj_points[0, 0], traj_points[0, 1], traj_points[0, 2], c='green', s=200, marker='o', label='Start')
     ax6.scatter(traj_points[-1, 0], traj_points[-1, 1], traj_points[-1, 2], c='red', s=200, marker='x', label='End')
     ax6.set_xlabel('X (m)')
     ax6.set_ylabel('Y (m)')
     ax6.set_zlabel('Z (m)')
-    ax6.set_title('B-Spline Trajectory - 3D View')
+    ax6.set_title('B-Spline + Actual Trajectory - 3D View')
     ax6.legend(fontsize=8)
 
     plt.tight_layout()
@@ -603,11 +614,21 @@ def save_trajectory_3d_plot(
     desired = np.array(trajectory_desired)
     waypoints_arr = np.array(waypoints)
 
+    # Interpolate desired to match actual length for error calculation
+    if len(actual) != len(desired):
+        from scipy.interpolate import interp1d
+        t_desired = np.linspace(0, 1, len(desired))
+        t_actual = np.linspace(0, 1, len(actual))
+        interp_func = interp1d(t_desired, desired, axis=0, kind='linear')
+        desired_interp = interp_func(t_actual)
+    else:
+        desired_interp = desired
+
     # Create figure with 2x2 subplots
     fig = plt.figure(figsize=(16, 14))
 
-    # Calculate errors for coloring
-    errors = np.linalg.norm(actual - desired, axis=1) * 100  # in cm
+    # Calculate errors for coloring (using interpolated desired)
+    errors = np.linalg.norm(actual - desired_interp, axis=1) * 100  # in cm
 
     # --- Subplot 1: 3D view ---
     ax1 = fig.add_subplot(2, 2, 1, projection='3d')
