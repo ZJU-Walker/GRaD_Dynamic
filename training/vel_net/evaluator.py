@@ -33,9 +33,11 @@ from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 from training.vel_net.dataset import IMUAugmentation
 
 
-# Map configurations (same as waypoint_nav_geometric.py)
+# Map configurations (same as data_collector.py)
+# Each config specifies gs_map (GS scene) and waypoints
 MAP_CONFIGS = {
     "gate_mid": {
+        "gs_map": "gate_mid",
         "start": [-6.0, 0.0, 1.2],
         "waypoints": [
             [-0.2, -0.1, 1.2],
@@ -46,6 +48,7 @@ MAP_CONFIGS = {
         "destination": [7.5, -2.0, 1.2],
     },
     "gate_left": {
+        "gs_map": "gate_left",
         "start": [-6.0, 0.0, 1.2],
         "waypoints": [
             [-0.2, 1.2, 1.4],
@@ -55,6 +58,7 @@ MAP_CONFIGS = {
         "destination": [7.0, -2.0, 1.2],
     },
     "gate_right": {
+        "gs_map": "gate_mid",
         "start": [-6.0, 0.0, 1.3],
         "waypoints": [
             [-3.0, -1.0, 1.3],
@@ -64,6 +68,64 @@ MAP_CONFIGS = {
             [5.8, 0.0, 1.3],
         ],
         "destination": [7.0, -2.0, 1.3],
+    },
+    # Additional diverse trajectories (all use gate_mid scene)
+    "gate_mid_high": {
+        "gs_map": "gate_mid",
+        "start": [-6.0, 0.0, 1.6],
+        "waypoints": [
+            [-0.2, -0.1, 1.6],
+            [1.6, 0.7, 1.5],
+            [3.7, 1.5, 1.3],
+            [5.8, 0.0, 1.5],
+        ],
+        "destination": [7.5, -2.0, 1.6],
+    },
+    "gate_mid_low": {
+        "gs_map": "gate_mid",
+        "start": [-6.0, 0.0, 0.8],
+        "waypoints": [
+            [-0.2, -0.1, 0.8],
+            [1.6, 0.7, 0.7],
+            [3.7, 1.5, 0.5],
+            [5.8, 0.0, 0.6],
+        ],
+        "destination": [7.5, -2.0, 0.8],
+    },
+    "zigzag": {
+        "gs_map": "gate_mid",
+        "start": [-6.0, 0.0, 1.2],
+        "waypoints": [
+            [-4.0, 1.5, 1.0],
+            [-2.0, -1.5, 1.4],
+            [0.0, 1.5, 1.0],
+            [2.0, -1.0, 1.3],
+            [4.0, 1.0, 0.9],
+            [6.0, -0.5, 1.1],
+        ],
+        "destination": [7.5, -2.0, 1.2],
+    },
+    "straight": {
+        "gs_map": "gate_mid",
+        "start": [-6.0, 0.0, 1.2],
+        "waypoints": [
+            [-3.0, 0.0, 1.2],
+            [0.0, 0.0, 1.2],
+            [3.0, 0.0, 1.2],
+            [6.0, 0.0, 1.2],
+        ],
+        "destination": [7.5, 0.0, 1.2],
+    },
+    "reverse": {
+        "gs_map": "gate_mid",
+        "start": [7.5, -2.0, 1.2],
+        "waypoints": [
+            [5.8, 0.0, 0.9],
+            [3.7, 1.5, 0.7],
+            [1.6, 0.7, 1.1],
+            [-0.2, -0.1, 1.2],
+        ],
+        "destination": [-6.0, 0.0, 1.2],
     },
 }
 
@@ -75,6 +137,8 @@ def fly_and_evaluate(
     encoder: DualEncoder,
     vel_mean: torch.Tensor,
     vel_std: torch.Tensor,
+    accel_mean: torch.Tensor = None,
+    accel_std: torch.Tensor = None,
     delta_mean: torch.Tensor = None,
     delta_std: torch.Tensor = None,
     map_name: str = 'gate_mid',
@@ -84,19 +148,22 @@ def fly_and_evaluate(
     max_steps: int = 3000,
     smoothing: float = 0.18,
     imu_noise: bool = False,
+    action_noise: float = 0.0,
 ) -> Dict[str, float]:
     """
     Fly drone through trajectory and evaluate vel_net predictions.
 
-    Uses RESIDUAL prediction mode: vel_pred = prev_vel + delta
+    Uses DIRECT DELTA-V prediction mode: vel_pred = prev_vel + delta_v
 
     Args:
         model: Trained VELO_NET model
         encoder: Trained DualEncoder
         vel_mean: Velocity mean for normalizing INPUT prev_vel (3,)
         vel_std: Velocity std for normalizing INPUT prev_vel (3,)
-        delta_mean: Delta mean for denormalizing OUTPUT (3,)
-        delta_std: Delta std for denormalizing OUTPUT (3,)
+        accel_mean: Accel mean for normalizing INPUT accel (3,)
+        accel_std: Accel std for normalizing INPUT accel (3,)
+        delta_mean: Delta mean for denormalizing delta_v OUTPUT (3,)
+        delta_std: Delta std for denormalizing delta_v OUTPUT (3,)
         map_name: Map name
         v_avg: Average velocity (m/s)
         output_dir: Output directory for video and plots
@@ -104,6 +171,7 @@ def fly_and_evaluate(
         max_steps: Maximum simulation steps
         smoothing: B-spline corner smoothing
         imu_noise: Whether to add IMU noise augmentation (for realistic testing)
+        action_noise: Action noise std (0.0-0.3), adds random noise to body rates
 
     Returns:
         Dict with evaluation metrics
@@ -113,6 +181,8 @@ def fly_and_evaluate(
 
     vel_mean = vel_mean.to(device)
     vel_std = vel_std.to(device)
+    accel_mean = accel_mean.to(device) if accel_mean is not None else torch.zeros(3, device=device)
+    accel_std = accel_std.to(device) if accel_std is not None else torch.ones(3, device=device)
     delta_mean = delta_mean.to(device) if delta_mean is not None else torch.zeros(3, device=device)
     delta_std = delta_std.to(device) if delta_std is not None else torch.ones(3, device=device)
 
@@ -136,10 +206,13 @@ def fly_and_evaluate(
     print(f"  Map: {map_name}")
     print(f"  Velocity: {v_avg} m/s")
     print(f"  Output: {output_dir}")
+    if action_noise > 0:
+        print(f"  Action noise: std={action_noise}")
     print(f"{'='*60}\n")
 
     # 1. Setup trajectory (same as waypoint_nav_geometric.py)
     config = MAP_CONFIGS[map_name]
+    gs_map = config.get("gs_map", map_name)  # GS scene to use
     start_pos_pc = config["start"]
     waypoints_pc = config["waypoints"]
     destination_pc = config["destination"]
@@ -189,9 +262,9 @@ def fly_and_evaluate(
         print(f"Warning: Could not save trajectory_profile plot: {e}")
 
     # 2. Initialize environment
-    print("Initializing environment...")
+    print(f"Initializing environment (GS scene: {gs_map})...")
     env = SimpleDroneEnv(
-        map_name=map_name,
+        map_name=gs_map,  # Use GS scene from config
         device=device,
         num_envs=1,
         episode_length=max_steps,
@@ -291,6 +364,11 @@ def fly_and_evaluate(
             np.clip(thrust / controller.max_thrust, 0.0, 1.0),
         ])
 
+        # Add random noise to action (body rates only, not thrust)
+        if action_noise > 0:
+            noise = np.random.normal(0, action_noise, 3)
+            action[0:3] = np.clip(action[0:3] + noise, -1.0, 1.0)
+
         # Step environment - returns rgb, depth
         _, rgb, depth, done, info = env.step(action)
 
@@ -337,6 +415,9 @@ def fly_and_evaluate(
                 else:
                     accel_tensor = torch.from_numpy(accel_gt.astype(np.float32)).unsqueeze(0).to(device)
 
+                # Normalize acceleration for input
+                accel_norm = (accel_tensor - accel_mean) / accel_std
+
                 obs = torch.cat([
                     rot6d,           # 6
                     action_tensor,   # 4
@@ -344,16 +425,15 @@ def fly_and_evaluate(
                     prev_vel_norm.unsqueeze(0),   # 3 (normalized)
                     rgb_feat,        # 32
                     depth_feat,      # 32
-                    accel_tensor,    # 3 (IMU acceleration)
+                    accel_norm,      # 3 (normalized IMU acceleration)
                 ], dim=1)
 
-                # Model outputs CORRECTION (normalized) - use encode_step for GRU state
-                correction_mu_norm, _ = model.encode_step(obs)
+                # Model outputs delta_v (normalized) - use encode_step for GRU state
+                delta_v_mu_norm, _ = model.encode_step(obs)
 
-                # Denormalize correction and reconstruct velocity via physics + correction
-                correction_raw = correction_mu_norm.squeeze(0) * delta_std + delta_mean
-                vel_physics = prev_vel_raw + accel_tensor.squeeze(0) * model_dt
-                vel_pred_tensor = vel_physics + correction_raw
+                # Direct delta-v: vel_pred = prev_vel + delta_v
+                delta_v_raw = delta_v_mu_norm.squeeze(0) * delta_std + delta_mean
+                vel_pred_tensor = prev_vel_raw + delta_v_raw
                 vel_pred = vel_pred_tensor.cpu().numpy()
 
                 # Update prev_vel for next step
