@@ -204,6 +204,20 @@ class GradNavDynamic:
         self.vel_net_finetuning_started = False
         self.vel_net_loss = 0.0
 
+        # Curriculum learning setup (Phase 1 -> Phase 2 transition)
+        curriculum_cfg = cfg["params"].get("curriculum", {})
+        self.curriculum_enabled = curriculum_cfg.get('enabled', True)
+        self.phase1_end_iter = curriculum_cfg.get('phase1_end_iter', 200)
+        # Phase 2 schedule: list of [start_iter, spawn_prob] pairs
+        # Default: 30% at 200, 70% at 300, 100% at 400
+        self.phase2_schedule = curriculum_cfg.get('phase2_schedule', [
+            [200, 0.3],
+            [300, 0.7],
+            [400, 1.0]
+        ])
+        self.current_phase = 1
+        self.dynamic_spawn_prob = 0.0
+
         # replay buffer
         self.obs_buf = torch.zeros((self.steps_num, self.num_envs, self.num_obs), dtype = torch.float32, device = self.device)
         self.privilege_obs_buf = torch.zeros((self.steps_num, self.num_envs, self.num_privilege_obs), dtype = torch.float32, device = self.device)
@@ -489,6 +503,42 @@ class GradNavDynamic:
 
         return vel_net_loss.item()
 
+    def _update_curriculum(self, epoch):
+        """Update curriculum phase and spawn probability based on iteration.
+
+        Phase 1 (iter < phase1_end_iter): Static scene only
+        Phase 2 (iter >= phase1_end_iter): Dynamic obstacles with ramping spawn probability
+
+        Schedule format: [[start_iter, spawn_prob], ...]
+        Example: [[200, 0.3], [300, 0.7], [400, 1.0]]
+        """
+        prev_phase = self.current_phase
+        prev_prob = self.dynamic_spawn_prob
+
+        if self.iter_count < self.phase1_end_iter:
+            # Phase 1: Static only
+            self.current_phase = 1
+            self.dynamic_spawn_prob = 0.0
+        else:
+            # Phase 2: Dynamic with ramping spawn probability
+            self.current_phase = 2
+
+            # Find the appropriate spawn probability from schedule
+            # Schedule is sorted by start_iter, find the last one that applies
+            self.dynamic_spawn_prob = 0.0  # Default if no schedule matches
+            for start_iter, spawn_prob in self.phase2_schedule:
+                if self.iter_count >= start_iter:
+                    self.dynamic_spawn_prob = spawn_prob
+
+        # Update environment with current phase and spawn probability
+        if hasattr(self.env, 'current_phase'):
+            self.env.current_phase = self.current_phase
+            self.env.dynamic_spawn_prob = self.dynamic_spawn_prob
+
+        # Log phase transitions
+        if prev_phase != self.current_phase or abs(prev_prob - self.dynamic_spawn_prob) > 0.01:
+            print_info(f"[Curriculum] Phase {self.current_phase}, spawn_prob={self.dynamic_spawn_prob:.1%} (iter {self.iter_count})")
+
     def compute_vae_loss(self, obs, vel_obs, history_obs, done):
         self.time_report.start_timer("VAE training")
         vae_loss_dict = self.vae.loss_fn(history_obs.clone().detach(), obs.clone().detach())
@@ -677,6 +727,10 @@ class GradNavDynamic:
                 if self.iter_count >= self.vel_net_finetune_start_iter:
                     self.start_vel_net_finetuning()
 
+            # Curriculum learning: Phase 1 -> Phase 2 transition
+            if self.curriculum_enabled:
+                self._update_curriculum(epoch)
+
             # Multi gate training process
             if self.multi_gate:
                 if (epoch+1) % self.gate_change_time == 0:
@@ -825,6 +879,14 @@ class GradNavDynamic:
                 }
                 if self.vel_net_finetuning_started:
                     wandb_dict["vel_net_loss"] = self.vel_net_loss
+                # Curriculum learning tracking
+                if self.curriculum_enabled:
+                    wandb_dict["curriculum_phase"] = self.current_phase
+                    wandb_dict["dynamic_spawn_prob"] = self.dynamic_spawn_prob
+                # Dynamic obstacle metrics
+                if hasattr(self.env, 'get_dynamic_metrics'):
+                    dynamic_metrics = self.env.get_dynamic_metrics()
+                    wandb_dict.update(dynamic_metrics)
                 wandb.log(wandb_dict)
 
         self.time_report.end_timer("algorithm")
@@ -843,6 +905,16 @@ class GradNavDynamic:
         ckpt_path = cfg['params']['general']['checkpoint']
         ckpt_dir = os.path.dirname(ckpt_path)
         self.load(cfg['params']['general']['checkpoint'])
+
+        # Force Phase 2 with 100% spawn probability for evaluation
+        # Otherwise dynamic objects won't spawn (default is Phase 1 with 0% spawn)
+        if hasattr(self.env, 'use_dynamic_objects') and self.env.use_dynamic_objects:
+            self.current_phase = 2
+            self.dynamic_spawn_prob = 1.0
+            self.env.current_phase = 2
+            self.env.dynamic_spawn_prob = 1.0
+            print_info(f"[Play Mode] Forced Phase 2 with 100% dynamic object spawn probability")
+
         self.run(cfg['params']['config']['player']['games_num'])
 
     def save(self, filename = None):
