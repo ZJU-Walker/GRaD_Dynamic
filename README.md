@@ -8,7 +8,7 @@ The system performs:
 1. **A* Path Planning** - Finds collision-free paths through point cloud obstacles
 2. **B-Spline Trajectory Generation** - Creates smooth, flyable trajectories with velocity/acceleration profiles
 3. **Geometric Controller** - SE(3) controller for accurate trajectory tracking
-4. **Velocity Network** - Auto-regressive GRU network for velocity estimation (84-dim input with IMU fusion)
+4. **Velocity Network** - Auto-regressive GRU network for velocity estimation (84-dim input with direct delta-v prediction)
 
 ---
 
@@ -38,7 +38,28 @@ python controller/waypoint_nav_geometric.py --map gate_mid --v_avg 0.5 --save_3d
 
 ### 1. Data Collection
 
-Collect flight data using the geometric controller:
+Collect flight data using the geometric controller.
+
+#### Preview Trajectories First
+
+Before collecting data, preview trajectories to verify they're good:
+
+```bash
+# Preview a trajectory (saves video without collecting data)
+python training/vel_net/train_vel_net.py collect \
+    --map gate_mid --preview --v_avg 1.0
+
+# Preview all available trajectories
+python training/vel_net/train_vel_net.py collect --map gate_mid_high --preview --v_avg 1.0
+python training/vel_net/train_vel_net.py collect --map gate_mid_low --preview --v_avg 1.0
+python training/vel_net/train_vel_net.py collect --map zigzag --preview --v_avg 1.0
+python training/vel_net/train_vel_net.py collect --map straight --preview --v_avg 1.0
+python training/vel_net/train_vel_net.py collect --map reverse --preview --v_avg 1.0
+```
+
+Videos saved to `output/preview_{map_name}_v{v_avg}.mp4`.
+
+#### Collect Training Data
 
 ```bash
 # Collect 30 sequences with velocity variation [0.5, 2.0] m/s
@@ -49,23 +70,60 @@ python training/vel_net/train_vel_net.py collect \
     --v_min 0.5 --v_max 2.0 \
     --output_dir data/vel_net/sequences
 
-# Collect with fixed velocity (v_min == v_max)
+# Collect with action noise (recommended for robustness)
 python training/vel_net/train_vel_net.py collect \
     --map gate_mid \
-    --n_sequences 10 \
-    --v_min 1.0 --v_max 1.0
+    --n_sequences 30 \
+    --v_min 0.5 --v_max 2.0 \
+    --action_noise 0.1 \
+    --output_dir data/vel_net/sequences_noisy
+
+# Collect diverse trajectories with action noise
+python training/vel_net/train_vel_net.py collect \
+    --map gate_mid --n_sequences 10 --v_min 0.5 --v_max 2.0 \
+    --action_noise 0.1 --output_dir data/vel_net/sequences_diverse
+
+python training/vel_net/train_vel_net.py collect \
+    --map zigzag --n_sequences 10 --v_min 0.5 --v_max 2.0 \
+    --action_noise 0.1 --output_dir data/vel_net/sequences_diverse
+
+python training/vel_net/train_vel_net.py collect \
+    --map gate_mid_high --n_sequences 10 --v_min 0.5 --v_max 2.0 \
+    --action_noise 0.1 --output_dir data/vel_net/sequences_diverse
+
+# Collect with waypoint randomization (±0.3m variation per sequence)
+python training/vel_net/train_vel_net.py collect \
+    --map gate_mid --n_sequences 30 --v_min 0.5 --v_max 2.0 \
+    --action_noise 0.1 --waypoint_noise 0.3 \
+    --output_dir data/vel_net/sequences_diverse
 ```
 
 **Options:**
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--map` | Map name | `gate_mid` |
+| `--map` | Trajectory name (see below) | `gate_mid` |
 | `--n_sequences` | Number of sequences | `30` |
 | `--freq` | Collection frequency (Hz) | `30` |
 | `--v_min` | Min velocity (m/s) | `0.5` |
 | `--v_max` | Max velocity (m/s). If != v_min, random per sequence | `2.0` |
 | `--smoothing` | B-spline corner smoothing factor | `0.018` |
+| `--action_noise` | Action noise std (0.0-0.3) for robustness | `0.0` |
+| `--waypoint_noise` | Waypoint position noise std (m), adds ±noise to each waypoint per sequence | `0.0` |
 | `--output_dir` | Output directory | `data/vel_net/sequences` |
+| `--preview` | Preview trajectory only (no data collection) | off |
+| `--v_avg` | Average velocity for preview mode | `(v_min+v_max)/2` |
+
+**Available Trajectories:**
+| Trajectory | Description |
+|------------|-------------|
+| `gate_mid` | Through center of gate, default trajectory |
+| `gate_mid_high` | Higher altitude version of gate_mid |
+| `gate_mid_low` | Lower altitude version of gate_mid |
+| `gate_left` | Through left side of gate |
+| `gate_right` | Through right side of gate |
+| `zigzag` | Zigzag pattern with lateral movements |
+| `straight` | Straight line trajectory |
+| `reverse` | Reverse direction of gate_mid |
 
 **Note:** If `v_min == v_max`, fixed velocity is used. Otherwise, random velocity is sampled from [v_min, v_max] for each sequence.
 
@@ -215,22 +273,26 @@ encoder = DualEncoder(rgb_dim=32, depth_dim=32)
 # Encode images
 rgb_feat, depth_feat = encoder(rgb_image, depth_image)
 
+# Normalize inputs (using stats from checkpoint)
+prev_vel_norm = (prev_vel - vel_mean) / vel_std
+imu_accel_norm = (imu_accel - accel_mean) / accel_std
+
 # Build observation (84 dims)
 rot6d = quaternion_to_rot6d(quaternion)  # (B, 6)
 obs = torch.cat([
     rot6d,                    # (B, 6)
     action,                   # (B, 4)
     prev_action,              # (B, 4)
-    prev_vel,                 # (B, 3) - normalized
+    prev_vel_norm,            # (B, 3) - normalized
     rgb_feat,                 # (B, 32)
     depth_feat,               # (B, 32)
-    imu_accel,                # (B, 3)
+    imu_accel_norm,           # (B, 3) - normalized
 ], dim=1)
 
-# Predict velocity correction (physics-informed)
-correction_norm, _ = model.forward(obs)
-correction = correction_norm * delta_std + delta_mean
-velocity = prev_vel + imu_accel * dt + correction
+# Predict velocity (direct delta-v mode)
+delta_v_norm, _ = model.encode_step(obs)
+delta_v = delta_v_norm * delta_std + delta_mean
+velocity = prev_vel + delta_v  # No physics integration
 ```
 
 ---
@@ -293,13 +355,18 @@ GRaD_Dynamic_onboard/
 
 ---
 
-## Map Configurations
+## Map/Trajectory Configurations
 
-| Map | Start (PC space) | Waypoints | Destination |
-|-----|------------------|-----------|-------------|
-| `gate_mid` | [-6, 0, 1.2] | 4 waypoints | [7.5, -2, 1.2] |
-| `gate_left` | [-6, 0, 1.2] | 3 waypoints | [7, -2, 1.2] |
-| `gate_right` | [-6, 0, 1.3] | 5 waypoints | [7, -2, 1.3] |
+| Trajectory | Start (PC space) | Waypoints | Destination | Description |
+|------------|------------------|-----------|-------------|-------------|
+| `gate_mid` | [-6, 0, 1.2] | 4 | [7.5, -2, 1.2] | Default center trajectory |
+| `gate_mid_high` | [-6, 0, 1.6] | 4 | [7.5, -2, 1.6] | Higher altitude |
+| `gate_mid_low` | [-6, 0, 0.8] | 4 | [7.5, -2, 0.8] | Lower altitude |
+| `gate_left` | [-6, 0, 1.2] | 3 | [7, -2, 1.2] | Left side of gate |
+| `gate_right` | [-6, 0, 1.3] | 5 | [7, -2, 1.3] | Right side of gate |
+| `zigzag` | [-6, 0, 1.2] | 6 | [7.5, -2, 1.2] | Lateral zigzag |
+| `straight` | [-6, 0, 1.2] | 4 | [7.5, 0, 1.2] | Straight line |
+| `reverse` | [7.5, -2, 1.2] | 4 | [-6, 0, 1.2] | Reverse of gate_mid |
 
 
 # GRaD Nav policy
@@ -336,6 +403,35 @@ python examples/train_gradnav_dynamic.py \
       --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/dynamic_gradnav_cylinder_test_0115/gate_mid/01-15-2026-02-52-33/best_policy.pt \
       --play --render
 ```
+
+## To train with curriculum learning (danger-aware retreat)
+2-phase curriculum: Phase 1 (static) → Phase 2 (dynamic with danger-aware rewards)
+```bash
+python examples/train_gradnav_dynamic.py \
+      --cfg examples/cfg/gradnav/drone_dynamic_curriculum.yaml \
+      --logdir checkpoints/gradnav_curriculum \
+      --device cuda:0
+```
+
+**Curriculum Schedule (configurable in YAML):**
+- iter 0-200: Phase 1 (static only, original reward)
+- iter 200-300: Phase 2 with 30% dynamic obstacle spawn
+- iter 300-400: Phase 2 with 70% dynamic obstacle spawn
+- iter 400+: Phase 2 with 100% dynamic obstacle spawn
+
+**Phase 2 adds danger-aware rewards:**
+- Retreat reward: encourages increasing distance when obstacle approaching
+- No-forward penalty: discourages forward motion when in danger
+- Backward penalty: small regularization to prevent always reversing
+
+## To eval curriculum-trained policy
+```bash
+python examples/train_gradnav_dynamic.py \
+      --cfg examples/cfg/gradnav/drone_dynamic_curriculum.yaml \
+      --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/gradnav_curriculum/gate_mid/01-20-2026-15-44-29/best_policy.pt \
+      --play --render
+```
+
 ---
 
 # Dynamic Obstacle Support
