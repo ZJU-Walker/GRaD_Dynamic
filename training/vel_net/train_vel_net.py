@@ -45,19 +45,31 @@ from models.vel_net.visual_encoder import DualEncoder
 
 
 def collect_command(args):
-    """Run data collection."""
-    from training.vel_net.data_collector import collect_sequences
-
-    collect_sequences(
-        output_dir=args.output_dir,
-        map_name=args.map,
-        n_sequences=args.n_sequences,
-        collection_freq=args.freq,
-        v_min=args.v_min,
-        v_max=args.v_max,
-        smoothing=args.smoothing,
-        device=args.device,
-    )
+    """Run data collection or preview."""
+    if args.preview:
+        from training.vel_net.data_collector import preview_trajectory
+        preview_trajectory(
+            map_name=args.map,
+            v_avg=args.v_avg if hasattr(args, 'v_avg') and args.v_avg else (args.v_min + args.v_max) / 2,
+            smoothing=args.smoothing,
+            action_noise=args.action_noise,
+            output_path=args.output_video,
+            device=args.device,
+        )
+    else:
+        from training.vel_net.data_collector import collect_sequences
+        collect_sequences(
+            output_dir=args.output_dir,
+            map_name=args.map,
+            n_sequences=args.n_sequences,
+            collection_freq=args.freq,
+            v_min=args.v_min,
+            v_max=args.v_max,
+            smoothing=args.smoothing,
+            action_noise=args.action_noise,
+            waypoint_noise=args.waypoint_noise,
+            device=args.device,
+        )
 
 
 def train_command(args):
@@ -143,6 +155,8 @@ def train_command(args):
             test_sequence_path=test_seq,
             vel_mean=trainer.vel_mean,
             vel_std=trainer.vel_std,
+            accel_mean=trainer.accel_mean,
+            accel_std=trainer.accel_std,
             delta_mean=trainer.delta_mean,
             delta_std=trainer.delta_std,
             device=device,
@@ -152,7 +166,7 @@ def train_command(args):
 
 
 def test_command(args):
-    """Run auto-regressive test with RESIDUAL prediction."""
+    """Run auto-regressive test with DIRECT DELTA-V prediction."""
     from training.vel_net.trainer import autoregressive_test
 
     device = args.device
@@ -181,14 +195,17 @@ def test_command(args):
     # Load normalization stats
     vel_mean = checkpoint.get('vel_mean', torch.zeros(3))
     vel_std = checkpoint.get('vel_std', torch.ones(3))
+    accel_mean = checkpoint.get('accel_mean', torch.zeros(3))
+    accel_std = checkpoint.get('accel_std', torch.ones(3))
     delta_mean = checkpoint.get('delta_mean', torch.zeros(3))
     delta_std = checkpoint.get('delta_std', torch.ones(3))
-    residual_mode = checkpoint.get('residual_mode', False)
+    direct_delta_mode = checkpoint.get('direct_delta_mode', checkpoint.get('residual_mode', False))
 
     print(f"  Velocity norm (input): mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
-    if residual_mode:
+    print(f"  Accel norm (input):    mean={accel_mean.cpu().numpy()}, std={accel_std.cpu().numpy()}")
+    if direct_delta_mode:
         print(f"  Delta norm (output):   mean={delta_mean.cpu().numpy()}, std={delta_std.cpu().numpy()}")
-        print(f"  Mode: RESIDUAL (vel_pred = prev_vel + delta)")
+        print(f"  Mode: DIRECT DELTA-V (vel_pred = prev_vel + delta_v)")
     else:
         print(f"  Mode: ABSOLUTE (legacy checkpoint)")
 
@@ -199,6 +216,8 @@ def test_command(args):
         test_sequence_path=args.test_seq,
         vel_mean=vel_mean,
         vel_std=vel_std,
+        accel_mean=accel_mean,
+        accel_std=accel_std,
         delta_mean=delta_mean,
         delta_std=delta_std,
         device=device,
@@ -209,7 +228,7 @@ def test_command(args):
 
 
 def eval_command(args):
-    """Run evaluation flight with trained model (RESIDUAL prediction mode)."""
+    """Run evaluation flight with trained model (DIRECT DELTA-V prediction mode)."""
     from training.vel_net.evaluator import fly_and_evaluate
 
     device = args.device
@@ -238,14 +257,17 @@ def eval_command(args):
     # Load normalization stats
     vel_mean = checkpoint.get('vel_mean', torch.zeros(3))
     vel_std = checkpoint.get('vel_std', torch.ones(3))
+    accel_mean = checkpoint.get('accel_mean', torch.zeros(3))
+    accel_std = checkpoint.get('accel_std', torch.ones(3))
     delta_mean = checkpoint.get('delta_mean', torch.zeros(3))
     delta_std = checkpoint.get('delta_std', torch.ones(3))
-    residual_mode = checkpoint.get('residual_mode', False)
+    direct_delta_mode = checkpoint.get('direct_delta_mode', checkpoint.get('residual_mode', False))
 
     print(f"  Velocity norm (input): mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
-    if residual_mode:
+    print(f"  Accel norm (input):    mean={accel_mean.cpu().numpy()}, std={accel_std.cpu().numpy()}")
+    if direct_delta_mode:
         print(f"  Delta norm (output):   mean={delta_mean.cpu().numpy()}, std={delta_std.cpu().numpy()}")
-        print(f"  Mode: RESIDUAL (vel_pred = prev_vel + delta)")
+        print(f"  Mode: DIRECT DELTA-V (vel_pred = prev_vel + delta_v)")
     else:
         print(f"  Mode: ABSOLUTE (legacy checkpoint)")
 
@@ -255,6 +277,8 @@ def eval_command(args):
         encoder=encoder,
         vel_mean=vel_mean,
         vel_std=vel_std,
+        accel_mean=accel_mean,
+        accel_std=accel_std,
         delta_mean=delta_mean,
         delta_std=delta_std,
         map_name=args.map,
@@ -264,6 +288,7 @@ def eval_command(args):
         max_steps=args.max_steps,
         smoothing=args.smoothing,
         imu_noise=args.imu_noise,
+        action_noise=args.action_noise,
     )
 
 
@@ -281,8 +306,10 @@ def main():
     collect_parser.add_argument('--output_dir', type=str, default='data/vel_net/sequences',
                                 help='Output directory for sequences')
     collect_parser.add_argument('--map', type=str, default='gate_mid',
-                                choices=['gate_mid', 'gate_left', 'gate_right'],
-                                help='Map name')
+                                choices=['gate_mid', 'gate_left', 'gate_right',
+                                         'gate_mid_high', 'gate_mid_low', 'zigzag',
+                                         'straight', 'reverse'],
+                                help='Map/trajectory name')
     collect_parser.add_argument('--n_sequences', type=int, default=30,
                                 help='Number of sequences to collect')
     collect_parser.add_argument('--freq', type=float, default=30.0,
@@ -293,6 +320,16 @@ def main():
                                 help='Max velocity (m/s)')
     collect_parser.add_argument('--smoothing', type=float, default=0.018,
                                 help='B-spline corner smoothing factor')
+    collect_parser.add_argument('--action_noise', type=float, default=0.0,
+                                help='Action noise std (0.0-0.3), adds random noise to body rates')
+    collect_parser.add_argument('--waypoint_noise', type=float, default=0.0,
+                                help='Waypoint position noise std (m), e.g., 0.3 for ±0.3m random variation')
+    collect_parser.add_argument('--preview', action='store_true',
+                                help='Preview trajectory (fly once and save video, no data collection)')
+    collect_parser.add_argument('--v_avg', type=float, default=None,
+                                help='Average velocity for preview mode (default: (v_min+v_max)/2)')
+    collect_parser.add_argument('--output_video', type=str, default=None,
+                                help='Output video path for preview mode')
     collect_parser.add_argument('--device', type=str, default='cuda:0',
                                 help='PyTorch device')
 
@@ -374,8 +411,10 @@ def main():
     eval_parser.add_argument('--checkpoint', type=str, required=True,
                              help='Path to checkpoint')
     eval_parser.add_argument('--map', type=str, default='gate_mid',
-                             choices=['gate_mid', 'gate_left', 'gate_right'],
-                             help='Map name')
+                             choices=['gate_mid', 'gate_left', 'gate_right',
+                                      'gate_mid_high', 'gate_mid_low', 'zigzag',
+                                      'straight', 'reverse'],
+                             help='Map/trajectory name')
     eval_parser.add_argument('--v_avg', type=float, default=1.0,
                              help='Average velocity (m/s)')
     eval_parser.add_argument('--smoothing', type=float, default=0.018,
@@ -386,6 +425,8 @@ def main():
                              help='Output directory')
     eval_parser.add_argument('--imu_noise', action='store_true',
                              help='Add IMU noise augmentation for realistic testing')
+    eval_parser.add_argument('--action_noise', type=float, default=0.0,
+                             help='Action noise std (0.0-0.3), adds random noise to body rates')
     eval_parser.add_argument('--device', type=str, default='cuda:0',
                              help='PyTorch device')
 
