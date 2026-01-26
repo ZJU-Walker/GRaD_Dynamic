@@ -65,8 +65,15 @@ class EnvConfig:
     obst_threshold: float = 0.5
 
     # Dynamic obstacle reward (for DynamicDroneEnv)
-    dynamic_obst_threshold: float = 1   # Distance threshold to apply reward (meters)
-    dynamic_obst_strength: float = 1.0    # Reward multiplier (higher = stronger avoidance)
+    dynamic_obst_threshold: float = 2   # Distance threshold to apply reward (meters)
+    dynamic_obst_strength: float = 5.0    # Reward multiplier (higher = stronger avoidance)
+
+    # Phase 2 danger-aware reward weights (curriculum training)
+    k_retreat: float = 8.0              # Retreat reward weight (encourage increasing distance when danger)
+    k_no_forward: float = 5.0           # No-forward penalty weight (discourage forward when danger)
+    k_backward: float = 0.5             # Backward regularization weight (prevent always reversing)
+    danger_dist_threshold: float = 2.0  # Distance threshold for danger detection (meters)
+    danger_ttc_threshold: float = 3.0   # TTC threshold for danger detection (seconds)
 
     # ==========================================================================
     # Environment Parameters
