@@ -124,8 +124,9 @@ class SimpleDroneEnv:
     def _init_gs_renderer(self):
         """Initialize the Gaussian Splatting renderer."""
         gs_path = Path(__file__).parent / "assets" / "gs_data"
-        self.gs = get_gs(self.map_name, gs_path, self.render_resolution)
-        print(f"  GS renderer initialized")
+        device_str = str(self.device)  # e.g., 'cuda:0' or 'cuda:1'
+        self.gs = get_gs(self.map_name, gs_path, self.render_resolution, device=device_str)
+        print(f"  GS renderer initialized on {device_str}")
 
     def _init_point_cloud(self):
         """Initialize the point cloud for collision detection."""
