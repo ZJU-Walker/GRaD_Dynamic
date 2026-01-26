@@ -22,14 +22,17 @@ torch.set_float32_matmul_precision('high')
 
 
 class GS():
-    def __init__(self, config_path: Path, width: int = 640, height: int = 360, res: float = 0.15) -> None:
+    def __init__(self, config_path: Path, width: int = 640, height: int = 360, res: float = 0.15, device: str = None) -> None:
         # config path
         self.config_path = config_path
         print(self.config_path)
 
         # Pytorch Config
-        use_cuda = torch.cuda.is_available()
-        self.device = torch.device("cuda:0" if use_cuda else "cpu")
+        if device is not None:
+            self.device = torch.device(device)
+        else:
+            use_cuda = torch.cuda.is_available()
+            self.device = torch.device("cuda:0" if use_cuda else "cpu")
 
         # Get config and pipeline
         self.config, self.pipeline, _, _ = eval_setup(
@@ -139,7 +142,7 @@ class GS():
         return torch.stack(depth_batch, dim=0), torch.stack(img_batch, dim=0)
 
 
-def get_gs(map_name: str, gs_path, resolution) -> GS:
+def get_gs(map_name: str, gs_path, resolution, device: str = None) -> GS:
     """
     Get a GS instance for the specified map.
 
@@ -147,6 +150,7 @@ def get_gs(map_name: str, gs_path, resolution) -> GS:
         map_name: Name of the map (gate_mid, gate_left, gate_right, etc.)
         gs_path: Path to gs_data directory
         resolution: Rendering resolution quality
+        device: Device string (e.g., 'cuda:0', 'cuda:1')
 
     Returns:
         GS instance for rendering
@@ -174,7 +178,7 @@ def get_gs(map_name: str, gs_path, resolution) -> GS:
     # Go into NeRF data folder and get NeRF object (because the NeRF instantation
     # requires the current working directory to be the NeRF data folder)
     os.chdir(gs_path)
-    gs = GS(Path(nerf_cfg_path), res=resolution)
+    gs = GS(Path(nerf_cfg_path), res=resolution, device=device)
     os.chdir(main_dir_path)
 
     return gs
