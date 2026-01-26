@@ -1,19 +1,21 @@
 """
-Velocity Network Trainer with IMU-Vision Fusion.
+Velocity Network Trainer with Direct Delta-V Prediction.
 
 Scheduled sampling gradually transitions from teacher forcing (using GT prev_vel)
 to auto-regressive inference (using predicted prev_vel). This prevents the model
 from learning the "copying shortcut" where it just outputs prev_vel.
 
-IMU FUSION MODE:
-The network fuses noisy IMU data with visual correction:
-    v_t = v_{t-1} + (a_imu * dt) + Network(obs)
+DIRECT DELTA-V MODE:
+The network directly predicts velocity change from observations:
+    v_t = v_{t-1} + Network(obs)
 
 Where:
-- a_imu: Corrupted IMU acceleration (from dataset with noise augmentation)
-- Network(obs): Learned visual correction for IMU bias/drift
+- obs: Includes normalized IMU acceleration as an input feature (indicator)
+- Network(obs): Directly predicts delta_v (velocity change)
 
-The IMU noise forces the network to use vision to correct IMU errors:
+IMU acceleration is kept in the observation as a feature but is NOT used for
+physics integration. IMU noise augmentation during training helps the network
+learn to be robust to noisy IMU readings:
 - Bias drift: constant offset per sequence
 - Scale error: multiplicative factor
 - White noise: per-frame Gaussian
@@ -129,10 +131,13 @@ class VelNetTrainer:
         self.epochs_without_improvement = 0
 
         # Compute normalization stats from training data
-        # vel_mean/std: for normalizing prev_vel INPUT to the model
-        # delta_mean/std: for normalizing the delta OUTPUT (target)
-        self.vel_mean, self.vel_std, self.delta_mean, self.delta_std = self._compute_velocity_stats()
+        # vel_mean/std: for normalizing prev_vel INPUT
+        # accel_mean/std: for normalizing acceleration INPUT
+        # delta_mean/std: for normalizing delta_v OUTPUT (target)
+        stats = self._compute_velocity_stats()
+        self.vel_mean, self.vel_std, self.accel_mean, self.accel_std, self.delta_mean, self.delta_std = stats
         print(f"  Velocity normalization (input): mean={self.vel_mean.cpu().numpy()}, std={self.vel_std.cpu().numpy()}")
+        print(f"  Accel normalization (input):    mean={self.accel_mean.cpu().numpy()}, std={self.accel_std.cpu().numpy()}")
         print(f"  Delta normalization (output):   mean={self.delta_mean.cpu().numpy()}, std={self.delta_std.cpu().numpy()}")
 
         # Wandb
@@ -149,24 +154,28 @@ class VelNetTrainer:
                 },
             )
 
-    def _compute_velocity_stats(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute velocity and delta statistics from training data for normalization.
+    def _compute_velocity_stats(self) -> Tuple[torch.Tensor, ...]:
+        """Compute velocity, acceleration, and delta statistics from training data.
 
         Returns:
             vel_mean, vel_std: For normalizing prev_vel INPUT
-            delta_mean, delta_std: For normalizing delta OUTPUT (target)
+            accel_mean, accel_std: For normalizing acceleration INPUT
+            delta_mean, delta_std: For normalizing delta_v OUTPUT (target)
         """
         all_vels = []
+        all_accels = []
         all_deltas = []
 
         for batch in self.train_loader:
             for b_idx in range(len(batch['velocities_gt'])):
                 vel_gt = batch['velocities_gt'][b_idx].numpy()
                 prev_vel = batch['initial_prev_vels'][b_idx].numpy()
+                accel = batch['accel_gt'][b_idx].numpy()  # Use GT accel for stats
 
                 all_vels.append(vel_gt)
+                all_accels.append(accel)
 
-                # Compute delta: vel_gt[t] - prev_vel[t] for each timestep
+                # Compute delta_v: vel_gt[t] - prev_vel[t] for each timestep
                 # For first frame, delta = vel_gt[0] - initial_prev_vel
                 # For subsequent frames, delta = vel_gt[t] - vel_gt[t-1]
                 deltas = np.zeros_like(vel_gt)
@@ -175,19 +184,25 @@ class VelNetTrainer:
                 all_deltas.append(deltas)
 
         all_vels = np.concatenate(all_vels, axis=0)
+        all_accels = np.concatenate(all_accels, axis=0)
         all_deltas = np.concatenate(all_deltas, axis=0)
 
-        # Velocity stats (for input normalization)
+        # Velocity stats (for prev_vel input normalization)
         vel_mean = torch.from_numpy(all_vels.mean(axis=0).astype(np.float32)).to(self.device)
         vel_std = torch.from_numpy(all_vels.std(axis=0).astype(np.float32)).to(self.device)
         vel_std = torch.clamp(vel_std, min=1e-6)
 
-        # Delta stats (for output normalization)
+        # Acceleration stats (for accel input normalization)
+        accel_mean = torch.from_numpy(all_accels.mean(axis=0).astype(np.float32)).to(self.device)
+        accel_std = torch.from_numpy(all_accels.std(axis=0).astype(np.float32)).to(self.device)
+        accel_std = torch.clamp(accel_std, min=1e-6)
+
+        # Delta stats (for delta_v output normalization)
         delta_mean = torch.from_numpy(all_deltas.mean(axis=0).astype(np.float32)).to(self.device)
         delta_std = torch.from_numpy(all_deltas.std(axis=0).astype(np.float32)).to(self.device)
         delta_std = torch.clamp(delta_std, min=1e-6)
 
-        return vel_mean, vel_std, delta_mean, delta_std
+        return vel_mean, vel_std, accel_mean, accel_std, delta_mean, delta_std
 
     def normalize_velocity(self, vel: torch.Tensor) -> torch.Tensor:
         """Normalize velocity to zero-mean, unit-variance (for input)."""
@@ -204,6 +219,10 @@ class VelNetTrainer:
     def denormalize_delta(self, delta_norm: torch.Tensor) -> torch.Tensor:
         """Denormalize delta back to original scale (m/s)."""
         return delta_norm * self.delta_std + self.delta_mean
+
+    def normalize_accel(self, accel: torch.Tensor) -> torch.Tensor:
+        """Normalize acceleration to zero-mean, unit-variance (for input)."""
+        return (accel - self.accel_mean) / self.accel_std
 
     def get_teacher_forcing_ratio(self) -> float:
         """
@@ -263,13 +282,13 @@ class VelNetTrainer:
         return True
 
     def train_epoch(self, pbar: tqdm = None) -> Dict[str, float]:
-        """Train for one epoch with scheduled sampling and IMU-Vision fusion.
+        """Train for one epoch with scheduled sampling and direct delta-v prediction.
 
-        IMU FUSION MODE: Model outputs correction, velocity = physics + correction
-        vel_physics = prev_vel + accel * dt
-        vel_pred = vel_physics + correction
+        DIRECT DELTA-V MODE: Model outputs delta_v, velocity = prev_vel + delta_v
+        vel_pred = prev_vel + delta_v
 
-        Loss is computed on the correction (normalized).
+        Loss is computed on the delta_v (normalized).
+        IMU acceleration is used as an input feature but NOT for physics integration.
         """
         from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 
@@ -324,22 +343,21 @@ class VelNetTrainer:
                     # Precompute rot6d for all frames
                     rot6d_all = quaternion_to_rot6d(orientations)  # (seq_len, 6)
 
-                    # Precompute GT corrections for the entire sequence
-                    # correction_gt[t] = vel_gt[t] - vel_physics[t]
-                    # where vel_physics[t] = prev_vel[t] + accel[t] * dt
-                    # For stable targets, use GT prev_vel for physics
-                    corrections_gt_raw = torch.zeros_like(velocities_gt_raw)
-                    # First frame: physics uses initial_prev_vel
-                    vel_physics_0 = prev_vel_raw + accel_aug[0] * dt
-                    corrections_gt_raw[0] = velocities_gt_raw[0] - vel_physics_0
-                    # Rest of frames: physics uses GT velocity at t-1
-                    for t in range(1, seq_length):
-                        vel_physics_t = velocities_gt_raw[t-1] + accel_aug[t] * dt
-                        corrections_gt_raw[t] = velocities_gt_raw[t] - vel_physics_t
+                    # Precompute GT delta_v for the entire sequence (direct delta-v mode)
+                    # delta_v_gt[t] = vel_gt[t] - prev_vel[t]
+                    # For stable targets, use GT prev_vel
+                    delta_v_gt_raw = torch.zeros_like(velocities_gt_raw)
+                    # First frame: delta = vel_gt[0] - initial_prev_vel
+                    delta_v_gt_raw[0] = velocities_gt_raw[0] - prev_vel_raw
+                    # Rest of frames: delta = vel_gt[t] - vel_gt[t-1]
+                    delta_v_gt_raw[1:] = velocities_gt_raw[1:] - velocities_gt_raw[:-1]
+
+                    # Normalize acceleration for input
+                    accel_aug_norm = self.normalize_accel(accel_aug)  # (seq_len, 3)
 
                     # Sequential GRU loop (needed for scheduled sampling)
                     for t in range(seq_length):
-                        # Build observation with IMU accel (84 dims)
+                        # Build observation with normalized IMU accel (84 dims)
                         obs = torch.cat([
                             rot6d_all[t:t+1],
                             actions[t:t+1],
@@ -347,27 +365,25 @@ class VelNetTrainer:
                             prev_vel_norm.unsqueeze(0),  # Normalized prev_vel as input
                             rgb_feat_all[t:t+1],
                             depth_feat_all[t:t+1],
-                            accel_aug[t:t+1],  # IMU acceleration (corrupted)
+                            accel_aug_norm[t:t+1],  # Normalized IMU acceleration
                         ], dim=1)
 
-                        # Model outputs CORRECTION (normalized)
-                        correction_mu_norm, _ = self.model.encode_step(obs)
+                        # Model outputs delta_v (normalized)
+                        delta_v_mu_norm, _ = self.model.encode_step(obs)
 
-                        # GT correction: vel_gt - vel_physics
-                        # Use GT prev_vel for physics to get stable targets
-                        correction_gt_raw = corrections_gt_raw[t:t+1]
-                        correction_gt_norm = self.normalize_delta(correction_gt_raw)
+                        # GT delta_v: vel_gt[t] - prev_vel[t] (direct delta-v)
+                        # For stable targets, use GT-based delta
+                        delta_v_gt_t = delta_v_gt_raw[t:t+1]
+                        delta_v_gt_norm = self.normalize_delta(delta_v_gt_t)
 
-                        # Loss on normalized correction
-                        loss = F.mse_loss(correction_mu_norm, correction_gt_norm)
+                        # Loss on normalized delta_v
+                        loss = F.mse_loss(delta_v_mu_norm, delta_v_gt_norm)
                         batch_loss += loss
                         batch_frames += 1
 
-                        # Reconstruct velocity for next step using physics + correction
-                        correction_pred_raw = self.denormalize_delta(correction_mu_norm)
-                        accel_t = accel_aug[t:t+1]
-                        vel_physics = prev_vel_raw_current.unsqueeze(0) + accel_t * dt
-                        vel_pred_raw = vel_physics + correction_pred_raw
+                        # Reconstruct velocity: vel_pred = prev_vel + delta_v (no physics integration)
+                        delta_v_pred_raw = self.denormalize_delta(delta_v_mu_norm)
+                        vel_pred_raw = prev_vel_raw_current.unsqueeze(0) + delta_v_pred_raw
                         vel_gt_raw = velocities_gt_raw[t:t+1]
 
                         # Track velocity reconstruction error (for monitoring)
@@ -423,17 +439,15 @@ class VelNetTrainer:
 
     @torch.no_grad()
     def validate_autoregressive(self) -> Dict[str, float]:
-        """Validate using auto-regressive inference with IMU-Vision fusion.
+        """Validate using auto-regressive inference with direct delta-v prediction.
 
-        IMU FUSION MODE: Model outputs correction, velocity = physics + correction
-        Note: Validation uses clean accel (no augmentation) to test correction ability.
+        DIRECT DELTA-V MODE: Model outputs delta_v, velocity = prev_vel + delta_v
+        Note: Validation uses clean accel (no augmentation) as input feature.
         """
         from models.vel_net.vel_obs_utils import quaternion_to_rot6d
 
         self.model.eval()
         self.encoder.eval()
-
-        dt = self.model.dt  # Time step for physics integration
 
         all_errors = []
         total_mse = 0.0
@@ -453,8 +467,11 @@ class VelNetTrainer:
 
                 # For model INPUT: normalize prev_vel
                 prev_vel_norm = self.normalize_velocity(prev_vel_raw)
-                # Keep raw prev_vel for physics integration
+                # Keep raw prev_vel for velocity reconstruction
                 prev_vel_raw_current = prev_vel_raw.clone()
+
+                # Normalize acceleration for input
+                accel_norm = self.normalize_accel(accel)  # (seq_len, 3)
 
                 # Load precomputed backbone features (already on GPU)
                 rgb_backbone, depth_backbone = self._load_backbone_features(seq_path)
@@ -472,7 +489,7 @@ class VelNetTrainer:
                 rot6d_all = quaternion_to_rot6d(orientations)
 
                 for t in range(seq_length):
-                    # Build observation with accel (84 dims)
+                    # Build observation with normalized accel (84 dims)
                     obs = torch.cat([
                         rot6d_all[t:t+1],
                         actions[t:t+1],
@@ -480,17 +497,15 @@ class VelNetTrainer:
                         prev_vel_norm.unsqueeze(0),  # Normalized input
                         rgb_feat_all[t:t+1],
                         depth_feat_all[t:t+1],
-                        accel[t:t+1],  # Clean acceleration for validation
+                        accel_norm[t:t+1],  # Normalized acceleration as input feature
                     ], dim=1)
 
-                    # Model outputs CORRECTION (normalized)
-                    correction_mu_norm, _ = self.model.encode_step(obs)
+                    # Model outputs delta_v (normalized)
+                    delta_v_mu_norm, _ = self.model.encode_step(obs)
 
-                    # Reconstruct velocity: vel_pred = vel_physics + correction
-                    correction_raw = self.denormalize_delta(correction_mu_norm)
-                    accel_t = accel[t:t+1]
-                    vel_physics = prev_vel_raw_current.unsqueeze(0) + accel_t * dt
-                    vel_pred = vel_physics + correction_raw
+                    # Reconstruct velocity: vel_pred = prev_vel + delta_v (direct delta-v)
+                    delta_v_raw = self.denormalize_delta(delta_v_mu_norm)
+                    vel_pred = prev_vel_raw_current.unsqueeze(0) + delta_v_raw
                     vel_gt = velocities_gt_raw[t:t+1]  # Raw GT in m/s
 
                     error = torch.abs(vel_pred - vel_gt).cpu().numpy()[0]
@@ -617,12 +632,15 @@ class VelNetTrainer:
             # vel_mean/std: for normalizing prev_vel INPUT
             'vel_mean': self.vel_mean.cpu(),
             'vel_std': self.vel_std.cpu(),
-            # delta_mean/std: for denormalizing correction OUTPUT (IMU FUSION MODE)
+            # accel_mean/std: for normalizing acceleration INPUT
+            'accel_mean': self.accel_mean.cpu(),
+            'accel_std': self.accel_std.cpu(),
+            # delta_mean/std: for denormalizing delta_v OUTPUT (DIRECT DELTA-V MODE)
             'delta_mean': self.delta_mean.cpu(),
             'delta_std': self.delta_std.cpu(),
             # Mode flags
-            'imu_fusion_mode': True,  # Uses physics + correction
-            'residual_mode': True,    # For backward compatibility
+            'direct_delta_mode': True,  # vel = prev_vel + delta_v (no physics integration)
+            'residual_mode': True,      # For backward compatibility
         }
         torch.save(checkpoint, path)
         print(f"  Saved: {path}")
@@ -645,6 +663,8 @@ def autoregressive_test(
     test_sequence_path: str,
     vel_mean: torch.Tensor,
     vel_std: torch.Tensor,
+    accel_mean: torch.Tensor = None,
+    accel_std: torch.Tensor = None,
     delta_mean: torch.Tensor = None,
     delta_std: torch.Tensor = None,
     device: str = 'cuda:0',
@@ -653,16 +673,17 @@ def autoregressive_test(
     plot_path: str = None,
 ) -> Dict[str, float]:
     """
-    Test model with auto-regressive inference using IMU-Vision fusion.
+    Test model with auto-regressive inference using direct delta-v prediction.
 
-    IMU FUSION MODE: vel_pred = vel_physics + correction
-    where vel_physics = prev_vel + accel * dt
+    DIRECT DELTA-V MODE: vel_pred = prev_vel + delta_v
 
     Args:
         vel_mean: Velocity mean for normalizing INPUT prev_vel (3,)
         vel_std: Velocity std for normalizing INPUT prev_vel (3,)
-        delta_mean: Delta mean for denormalizing correction OUTPUT (3,)
-        delta_std: Delta std for denormalizing correction OUTPUT (3,)
+        accel_mean: Accel mean for normalizing INPUT accel (3,)
+        accel_std: Accel std for normalizing INPUT accel (3,)
+        delta_mean: Delta mean for denormalizing delta_v OUTPUT (3,)
+        delta_std: Delta std for denormalizing delta_v OUTPUT (3,)
     """
     from PIL import Image
     from models.vel_net.vel_obs_utils import quaternion_to_rot6d
@@ -672,9 +693,11 @@ def autoregressive_test(
 
     vel_mean = vel_mean.to(device)
     vel_std = vel_std.to(device)
+    accel_mean = accel_mean.to(device) if accel_mean is not None else torch.zeros(3, device=device)
+    accel_std = accel_std.to(device) if accel_std is not None else torch.ones(3, device=device)
     delta_mean = delta_mean.to(device) if delta_mean is not None else torch.zeros(3, device=device)
     delta_std = delta_std.to(device) if delta_std is not None else torch.ones(3, device=device)
-    dt = model.dt  # Time step for physics integration
+    dt = model.dt  # Time step for computing acceleration from velocities
 
     seq_path = Path(test_sequence_path)
     telemetry = np.load(seq_path / "telemetry.npz")
@@ -717,19 +740,19 @@ def autoregressive_test(
             action = torch.from_numpy(telemetry['actions'][t].astype(np.float32)).unsqueeze(0).to(device)
             prev_action = torch.from_numpy(telemetry['actions'][t-1].astype(np.float32)).unsqueeze(0).to(device)
 
-            # Get acceleration for this frame
+            # Get acceleration for this frame and normalize
             accel = torch.from_numpy(accel_gt[t].astype(np.float32)).unsqueeze(0).to(device)
+            accel_norm = (accel - accel_mean) / accel_std
 
-            # Build observation with IMU accel (84 dims)
-            obs = torch.cat([rot6d, action, prev_action, prev_vel_norm.unsqueeze(0), rgb_feat, depth_feat, accel], dim=1)
+            # Build observation with normalized accel (84 dims)
+            obs = torch.cat([rot6d, action, prev_action, prev_vel_norm.unsqueeze(0), rgb_feat, depth_feat, accel_norm], dim=1)
 
-            # Model outputs CORRECTION (normalized)
-            correction_mu_norm, _ = model.encode_step(obs)
+            # Model outputs delta_v (normalized)
+            delta_v_mu_norm, _ = model.encode_step(obs)
 
-            # Physics integration + correction
-            correction_raw = correction_mu_norm.squeeze(0) * delta_std + delta_mean
-            vel_physics = prev_vel_raw + accel.squeeze(0) * dt
-            vel_pred = vel_physics + correction_raw
+            # Direct delta-v: vel_pred = prev_vel + delta_v
+            delta_v_raw = delta_v_mu_norm.squeeze(0) * delta_std + delta_mean
+            vel_pred = prev_vel_raw + delta_v_raw
 
             # Update for next step
             prev_vel_raw = vel_pred.detach()
@@ -753,7 +776,7 @@ def autoregressive_test(
         'ar/rmse': np.sqrt(np.mean(errors**2)),
     }
 
-    print(f"\nAuto-regressive Test (IMU Fusion, {n_frames-1} steps):")
+    print(f"\nAuto-regressive Test (Direct Delta-V, {n_frames-1} steps):")
     print(f"  MAE: {metrics['ar/mae']:.4f} m/s")
     print(f"  MAE (x,y,z): [{metrics['ar/mae_x']:.4f}, {metrics['ar/mae_y']:.4f}, {metrics['ar/mae_z']:.4f}]")
     print(f"  RMSE: {metrics['ar/rmse']:.4f} m/s")
@@ -771,7 +794,7 @@ def autoregressive_test(
         axes[0].set_ylabel('Vel X (m/s)')
         axes[0].legend(loc='upper right')
         axes[0].grid(True, alpha=0.3)
-        axes[0].set_title(f'Velocity Prediction (IMU-Vision Fusion) | MAE: {metrics["ar/mae"]:.4f} m/s')
+        axes[0].set_title(f'Velocity Prediction (Direct Delta-V) | MAE: {metrics["ar/mae"]:.4f} m/s')
 
         axes[1].plot(t_axis, all_gts[:, 1], 'b-', label='GT', linewidth=1.5)
         axes[1].plot(t_axis, all_preds[:, 1], 'r--', label='Pred', linewidth=1.5)
