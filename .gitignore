@@ -23,3 +23,5 @@ checkpoints/
 wandb/
 
 examples/logs
+
+*.npy
