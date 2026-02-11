@@ -69,6 +69,13 @@ class SimpleDroneEnv:
                 "target_pos": [7.0, -2.0, 1.3],
                 "waypoints": [[-0.2, -0.1, 1.4], [3.7, 1.5, 0.7]],
             },
+            "gate_mid_new": {
+                "gs_folder": "gate_mid_new",
+                "ply_file": "gate_mid_new.ply",
+                "start_pos": [-6.0, 0.0, 1.25],
+                "target_pos": [7.0, -2.0, 1.3],
+                "waypoints": [[-0.2, -0.1, 1.4], [3.7, 1.5, 0.7]],
+            },
             "gate_left": {
                 "gs_folder": "sv_917_3_left_nerfstudio",
                 "ply_file": "sv_917_3_left_nerfstudio.ply",
