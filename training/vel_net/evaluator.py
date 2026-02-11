@@ -141,7 +141,8 @@ def fly_and_evaluate(
     accel_std: torch.Tensor = None,
     delta_mean: torch.Tensor = None,
     delta_std: torch.Tensor = None,
-    map_name: str = 'gate_mid',
+    map_name: str = None,
+    waypoints_name: str = 'gate_mid',
     v_avg: float = 1.0,
     output_dir: str = 'output/vel_net_eval',
     device: str = 'cuda:0',
@@ -164,7 +165,8 @@ def fly_and_evaluate(
         accel_std: Accel std for normalizing INPUT accel (3,)
         delta_mean: Delta mean for denormalizing delta_v OUTPUT (3,)
         delta_std: Delta std for denormalizing delta_v OUTPUT (3,)
-        map_name: Map name
+        map_name: GS/point cloud map name. If None, uses the map from waypoints config.
+        waypoints_name: Waypoint trajectory configuration name
         v_avg: Average velocity (m/s)
         output_dir: Output directory for video and plots
         device: PyTorch device
@@ -200,10 +202,18 @@ def fly_and_evaluate(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Get GS map: use explicit map_name if provided, otherwise from waypoints config
+    config = MAP_CONFIGS[waypoints_name]
+    if map_name is not None:
+        gs_map = map_name
+    else:
+        gs_map = config.get("gs_map", waypoints_name)
+
     print(f"\n{'='*60}")
     print(f"Velocity Network Evaluation Flight")
     print(f"{'='*60}")
-    print(f"  Map: {map_name}")
+    print(f"  GS Map: {gs_map}")
+    print(f"  Waypoints: {waypoints_name}")
     print(f"  Velocity: {v_avg} m/s")
     print(f"  Output: {output_dir}")
     if action_noise > 0:
@@ -211,8 +221,6 @@ def fly_and_evaluate(
     print(f"{'='*60}\n")
 
     # 1. Setup trajectory (same as waypoint_nav_geometric.py)
-    config = MAP_CONFIGS[map_name]
-    gs_map = config.get("gs_map", map_name)  # GS scene to use
     start_pos_pc = config["start"]
     waypoints_pc = config["waypoints"]
     destination_pc = config["destination"]
@@ -245,19 +253,19 @@ def fly_and_evaluate(
             sampler=sampler,
             astar_path=path_pc,
             waypoints=full_waypoints_pc,
-            output_path=str(output_dir / f'eval_{map_name}_astar_bspline.png'),
+            output_path=str(output_dir / f'eval_{waypoints_name}_astar_bspline.png'),
             pc_offset=PC_TO_SIM_OFFSET,
         )
-        print(f"Saved: {output_dir}/eval_{map_name}_astar_bspline.png")
+        print(f"Saved: {output_dir}/eval_{waypoints_name}_astar_bspline.png")
     except Exception as e:
         print(f"Warning: Could not save astar_bspline plot: {e}")
 
     try:
         save_trajectory_profile(
             sampler=sampler,
-            output_path=str(output_dir / f'eval_{map_name}_trajectory_profile.png'),
+            output_path=str(output_dir / f'eval_{waypoints_name}_trajectory_profile.png'),
         )
-        print(f"Saved: {output_dir}/eval_{map_name}_trajectory_profile.png")
+        print(f"Saved: {output_dir}/eval_{waypoints_name}_trajectory_profile.png")
     except Exception as e:
         print(f"Warning: Could not save trajectory_profile plot: {e}")
 
@@ -500,7 +508,7 @@ def fly_and_evaluate(
     print(f"{'='*60}\n")
 
     # Save video
-    video_path = output_dir / f'eval_{map_name}_v{v_avg}.mp4'
+    video_path = output_dir / f'eval_{waypoints_name}_v{v_avg}.mp4'
     render_and_save(frames, str(video_path), fps=25)
     print(f"Video saved: {video_path}")
 
@@ -508,7 +516,7 @@ def fly_and_evaluate(
     if len(trajectory_actual) > 0 and len(trajectory_desired) > 0:
         waypoints_sim = [np.array(wp) + PC_TO_SIM_OFFSET for wp in full_waypoints_pc]
         try:
-            traj_plot_path = output_dir / f'eval_{map_name}_trajectory.png'
+            traj_plot_path = output_dir / f'eval_{waypoints_name}_trajectory.png'
             save_trajectory_3d_plot(
                 trajectory_actual=trajectory_actual,
                 trajectory_desired=trajectory_desired,
@@ -520,12 +528,12 @@ def fly_and_evaluate(
             print(f"Warning: Could not save trajectory plot: {e}")
 
     # Save velocity plot
-    plot_path = output_dir / f'eval_{map_name}_v{v_avg}_velocity.png'
+    plot_path = output_dir / f'eval_{waypoints_name}_v{v_avg}_velocity.png'
     save_velocity_plot(timestamps_arr, vel_gt_arr, vel_pred_arr, metrics, str(plot_path))
     print(f"Plot saved: {plot_path}")
 
     # Save data
-    data_path = output_dir / f'eval_{map_name}_v{v_avg}_data.npz'
+    data_path = output_dir / f'eval_{waypoints_name}_v{v_avg}_data.npz'
     np.savez(
         data_path,
         timestamps=timestamps_arr,

@@ -368,7 +368,7 @@ class DataCollector:
 
 
 def plan_and_generate_trajectory(
-    map_name: str,
+    waypoints_name: str,
     v_avg: float = 0.5,
     corner_smoothing: float = 0.018,
     waypoint_noise: float = 0.0,
@@ -377,7 +377,7 @@ def plan_and_generate_trajectory(
     Plan A* path and generate B-spline trajectory.
 
     Args:
-        map_name: Map/trajectory name
+        waypoints_name: Waypoint trajectory configuration name
         v_avg: Average velocity (m/s)
         corner_smoothing: B-spline corner smoothing factor
         waypoint_noise: Random noise std to add to waypoints (m), e.g., 0.3 for ±0.3m variation
@@ -389,7 +389,7 @@ def plan_and_generate_trajectory(
         path_pc: A* path in point cloud space (for plotting)
         waypoints_pc: Waypoints in point cloud space (for plotting)
     """
-    config = MAP_CONFIGS[map_name]
+    config = MAP_CONFIGS[waypoints_name]
 
     # 1. Waypoints in POINT CLOUD space
     start_pos_pc = list(config["start"])  # Make copies to avoid modifying config
@@ -473,7 +473,8 @@ def save_planning_plots(
 
 def collect_sequences(
     output_dir: str = "data/vel_net/sequences",
-    map_name: str = "gate_mid",
+    map_name: str = None,
+    waypoints_name: str = "gate_mid",
     n_sequences: int = 30,
     collection_freq: float = 30.0,
     v_min: float = 0.5,
@@ -486,6 +487,9 @@ def collect_sequences(
     """Collect multiple sequences for training.
 
     Args:
+        map_name: GS/point cloud map name (e.g., 'gate_mid', 'gate_left', 'clutter').
+                  If None, uses the gs_map from waypoints config.
+        waypoints_name: Waypoint trajectory configuration name (e.g., 'gate_mid_high', 'zigzag').
         v_min: Minimum velocity (m/s)
         v_max: Maximum velocity (m/s). If v_min == v_max, fixed velocity is used.
                Otherwise, random velocity is sampled uniformly from [v_min, v_max].
@@ -495,15 +499,18 @@ def collect_sequences(
     # Determine velocity mode
     vary_velocity = (v_min != v_max)
 
-    # Get GS map from config
-    gs_map = MAP_CONFIGS[map_name].get("gs_map", map_name)
+    # Get GS map: use explicit map_name if provided, otherwise from waypoints config
+    if map_name is not None:
+        gs_map = map_name
+    else:
+        gs_map = MAP_CONFIGS[waypoints_name].get("gs_map", waypoints_name)
 
     # Header
     print(f"\n{'='*60}")
     print(f"Velocity Network Data Collection")
     print(f"{'='*60}")
-    print(f"  Waypoints: {map_name}")
-    print(f"  GS Scene: {gs_map}")
+    print(f"  GS Map: {gs_map}")
+    print(f"  Waypoints: {waypoints_name}")
     print(f"  Sequences: {n_sequences}")
     print(f"  Collection freq: {collection_freq} Hz")
     if vary_velocity:
@@ -571,7 +578,7 @@ def collect_sequences(
 
         # Plan and generate trajectory (with optional waypoint randomization)
         sampler, start_pos_sim, waypoints_sim, path_pc, waypoints_pc = plan_and_generate_trajectory(
-            map_name=map_name,
+            waypoints_name=waypoints_name,
             v_avg=current_v_avg,
             corner_smoothing=smoothing,
             waypoint_noise=waypoint_noise,
@@ -634,7 +641,8 @@ def collect_sequences(
 
 
 def preview_trajectory(
-    map_name: str = "gate_mid",
+    map_name: str = None,
+    waypoints_name: str = "gate_mid",
     v_avg: float = 1.0,
     smoothing: float = 0.018,
     action_noise: float = 0.0,
@@ -647,11 +655,12 @@ def preview_trajectory(
     Preview a trajectory by flying it once and saving a video.
 
     Args:
-        map_name: Map/trajectory name
+        map_name: GS/point cloud map name. If None, uses the map from waypoints config.
+        waypoints_name: Waypoint trajectory configuration name
         v_avg: Average velocity (m/s)
         smoothing: B-spline corner smoothing
         action_noise: Action noise std (0.0-0.3)
-        output_path: Output video path (default: output/preview_{map_name}.mp4)
+        output_path: Output video path (default: output/preview_{waypoints_name}.mp4)
         device: PyTorch device
         max_steps: Maximum simulation steps
         fps: Output video FPS
@@ -662,18 +671,21 @@ def preview_trajectory(
     from controller.nav_helpers import render_and_save
 
     if output_path is None:
-        output_path = f"output/preview_{map_name}_v{v_avg:.1f}.mp4"
+        output_path = f"output/preview_{waypoints_name}_v{v_avg:.1f}.mp4"
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # Get GS map from config
-    gs_map = MAP_CONFIGS[map_name].get("gs_map", map_name)
+    # Get GS map: use explicit map_name if provided, otherwise from waypoints config
+    if map_name is not None:
+        gs_map = map_name
+    else:
+        gs_map = MAP_CONFIGS[waypoints_name].get("gs_map", waypoints_name)
 
     print(f"\n{'='*60}")
     print(f"Trajectory Preview")
     print(f"{'='*60}")
-    print(f"  Waypoints: {map_name}")
-    print(f"  GS Scene: {gs_map}")
+    print(f"  GS Map: {gs_map}")
+    print(f"  Waypoints: {waypoints_name}")
     print(f"  Velocity: {v_avg} m/s")
     if action_noise > 0:
         print(f"  Action noise: std={action_noise}")
@@ -682,7 +694,7 @@ def preview_trajectory(
 
     # Plan trajectory
     sampler, start_pos_sim, waypoints_sim, path_pc, waypoints_pc = plan_and_generate_trajectory(
-        map_name=map_name,
+        waypoints_name=waypoints_name,
         v_avg=v_avg,
         corner_smoothing=smoothing,
     )
@@ -816,9 +828,14 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Collect vel_net training data')
-    parser.add_argument('--output', type=str, default='data/vel_net/sequences')
-    parser.add_argument('--map', type=str, default='gate_mid',
-                        choices=list(MAP_CONFIGS.keys()))
+    parser.add_argument('--output', type=str, default='/scr/irislab/ke/data/vel_net/sequences')
+    parser.add_argument('--map', type=str, default=None,
+                        choices=['gate_mid', 'gate_left', 'gate_right',
+                                 'clutter', 'backroom', 'flightroom'],
+                        help='GS/point cloud map name. If not specified, uses the map from waypoints config.')
+    parser.add_argument('--waypoints', type=str, default='gate_mid',
+                        choices=list(MAP_CONFIGS.keys()),
+                        help='Waypoint trajectory configuration name')
     parser.add_argument('--preview', action='store_true',
                         help='Preview trajectory (fly once and save video, no data collection)')
     parser.add_argument('--n_sequences', type=int, default=30)
@@ -840,6 +857,7 @@ if __name__ == '__main__':
         # Preview mode: fly trajectory once and save video
         preview_trajectory(
             map_name=args.map,
+            waypoints_name=args.waypoints,
             v_avg=(args.v_min + args.v_max) / 2,  # Use average velocity for preview
             smoothing=args.smoothing,
             action_noise=args.action_noise,
@@ -850,6 +868,7 @@ if __name__ == '__main__':
         collect_sequences(
             output_dir=args.output,
             map_name=args.map,
+            waypoints_name=args.waypoints,
             n_sequences=args.n_sequences,
             collection_freq=args.freq,
             v_min=args.v_min,

@@ -8,6 +8,7 @@ Usage:
     # Collect training data
     python training/vel_net/train_vel_net.py collect \
         --map gate_mid \
+        --waypoints gate_mid_high \
         --n_sequences 30 \
         --v_min 0.5 --v_max 2.0
 
@@ -28,7 +29,7 @@ Usage:
     # Evaluation flight
     python training/vel_net/train_vel_net.py eval \
         --checkpoint checkpoints/vel_net/best.pt \
-        --map gate_mid --v_avg 1.0
+        --map gate_mid --waypoints gate_mid --v_avg 1.0
 """
 
 import os
@@ -50,6 +51,7 @@ def collect_command(args):
         from training.vel_net.data_collector import preview_trajectory
         preview_trajectory(
             map_name=args.map,
+            waypoints_name=args.waypoints,
             v_avg=args.v_avg if hasattr(args, 'v_avg') and args.v_avg else (args.v_min + args.v_max) / 2,
             smoothing=args.smoothing,
             action_noise=args.action_noise,
@@ -61,6 +63,7 @@ def collect_command(args):
         collect_sequences(
             output_dir=args.output_dir,
             map_name=args.map,
+            waypoints_name=args.waypoints,
             n_sequences=args.n_sequences,
             collection_freq=args.freq,
             v_min=args.v_min,
@@ -282,6 +285,7 @@ def eval_command(args):
         delta_mean=delta_mean,
         delta_std=delta_std,
         map_name=args.map,
+        waypoints_name=args.waypoints,
         v_avg=args.v_avg,
         output_dir=args.output_dir,
         device=device,
@@ -305,11 +309,15 @@ def main():
     collect_parser = subparsers.add_parser('collect', help='Collect training data')
     collect_parser.add_argument('--output_dir', type=str, default='data/vel_net/sequences',
                                 help='Output directory for sequences')
-    collect_parser.add_argument('--map', type=str, default='gate_mid',
+    collect_parser.add_argument('--map', type=str, default=None,
+                                choices=['gate_mid', 'gate_left', 'gate_right',
+                                         'clutter', 'backroom', 'flightroom'],
+                                help='GS/point cloud map name. If not specified, uses the map from waypoints config.')
+    collect_parser.add_argument('--waypoints', type=str, default='gate_mid',
                                 choices=['gate_mid', 'gate_left', 'gate_right',
                                          'gate_mid_high', 'gate_mid_low', 'zigzag',
                                          'straight', 'reverse'],
-                                help='Map/trajectory name')
+                                help='Waypoint trajectory configuration name')
     collect_parser.add_argument('--n_sequences', type=int, default=30,
                                 help='Number of sequences to collect')
     collect_parser.add_argument('--freq', type=float, default=30.0,
@@ -410,11 +418,15 @@ def main():
     eval_parser = subparsers.add_parser('eval', help='Evaluate model with live flight')
     eval_parser.add_argument('--checkpoint', type=str, required=True,
                              help='Path to checkpoint')
-    eval_parser.add_argument('--map', type=str, default='gate_mid',
+    eval_parser.add_argument('--map', type=str, default=None,
+                             choices=['gate_mid', 'gate_left', 'gate_right',
+                                      'clutter', 'backroom', 'flightroom'],
+                             help='GS/point cloud map name. If not specified, uses the map from waypoints config.')
+    eval_parser.add_argument('--waypoints', type=str, default='gate_mid',
                              choices=['gate_mid', 'gate_left', 'gate_right',
                                       'gate_mid_high', 'gate_mid_low', 'zigzag',
                                       'straight', 'reverse'],
-                             help='Map/trajectory name')
+                             help='Waypoint trajectory configuration name')
     eval_parser.add_argument('--v_avg', type=float, default=1.0,
                              help='Average velocity (m/s)')
     eval_parser.add_argument('--smoothing', type=float, default=0.018,
