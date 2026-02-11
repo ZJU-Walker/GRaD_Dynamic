@@ -69,8 +69,8 @@ class EnvConfig:
     dynamic_obst_strength: float = 5.0    # Reward multiplier (higher = stronger avoidance)
 
     # Phase 2 danger-aware reward weights (curriculum training)
-    k_retreat: float = 8.0              # Retreat reward weight (encourage increasing distance when danger)
-    k_no_forward: float = 5.0           # No-forward penalty weight (discourage forward when danger)
+    k_retreat: float = 12.0           # Retreat reward weight (encourage increasing distance when danger)
+    k_no_forward: float = 10.0           # No-forward penalty weight (discourage forward when danger)
     k_backward: float = 0.5             # Backward regularization weight (prevent always reversing)
     danger_dist_threshold: float = 2.0  # Distance threshold for danger detection (meters)
     danger_ttc_threshold: float = 3.0   # TTC threshold for danger detection (seconds)
@@ -145,5 +145,17 @@ def get_config(map_name: str = "gate_mid") -> EnvConfig:
             target_pos=[7.0, -2.0, 1.2],
         )
 
+    elif map_name == "gate_mid_new":
+        return EnvConfig(
+            map_name="gate_mid_new",
+            gs_folder="gate_mid_new",
+            ply_file="gate_mid_new.ply",
+            start_pos=[0.0, 0.0, 1.25],
+            waypoints=[
+                [3.0, 0.3, 1.3],
+            ],
+            target_pos=[6, 0.3, 1.3],
+        )
+
     else:
-        raise ValueError(f"Unknown map: {map_name}. Available: gate_mid, gate_right, gate_left")
+        raise ValueError(f"Unknown map: {map_name}. Available: gate_mid, gate_mid_new, gate_right, gate_left")
