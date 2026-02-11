@@ -46,25 +46,30 @@ Before collecting data, preview trajectories to verify they're good:
 
 ```bash
 # Preview a trajectory (saves video without collecting data)
+# --map: GS/point cloud map (gate_mid, gate_left, gate_right, clutter, backroom, flightroom)
+# --waypoints: trajectory configuration (gate_mid, gate_mid_high, zigzag, etc.)
 python training/vel_net/train_vel_net.py collect \
-    --map gate_mid --preview --v_avg 1.0
+    --map gate_mid --waypoints gate_mid --preview --v_avg 1.0
 
-# Preview all available trajectories
-python training/vel_net/train_vel_net.py collect --map gate_mid_high --preview --v_avg 1.0
-python training/vel_net/train_vel_net.py collect --map gate_mid_low --preview --v_avg 1.0
-python training/vel_net/train_vel_net.py collect --map zigzag --preview --v_avg 1.0
-python training/vel_net/train_vel_net.py collect --map straight --preview --v_avg 1.0
-python training/vel_net/train_vel_net.py collect --map reverse --preview --v_avg 1.0
+# Preview different waypoints on the same map
+python training/vel_net/train_vel_net.py collect --map gate_mid --waypoints gate_mid_high --preview --v_avg 1.0
+python training/vel_net/train_vel_net.py collect --map gate_mid --waypoints zigzag --preview --v_avg 1.0
+
+# If --map is omitted, uses the default map from waypoints config
+python training/vel_net/train_vel_net.py collect --waypoints gate_left --preview --v_avg 1.0
 ```
 
-Videos saved to `output/preview_{map_name}_v{v_avg}.mp4`.
+Videos saved to `output/preview_{waypoints}_v{v_avg}.mp4`.
 
 #### Collect Training Data
 
 ```bash
 # Collect 30 sequences with velocity variation [0.5, 2.0] m/s
+# --map: GS/point cloud map to use for rendering
+# --waypoints: trajectory configuration for waypoints
 python training/vel_net/train_vel_net.py collect \
     --map gate_mid \
+    --waypoints gate_mid \
     --n_sequences 30 \
     --freq 30 \
     --v_min 0.5 --v_max 2.0 \
@@ -73,35 +78,38 @@ python training/vel_net/train_vel_net.py collect \
 # Collect with action noise (recommended for robustness)
 python training/vel_net/train_vel_net.py collect \
     --map gate_mid \
+    --waypoints gate_mid \
     --n_sequences 30 \
     --v_min 0.5 --v_max 2.0 \
     --action_noise 0.1 \
     --output_dir data/vel_net/sequences_noisy
 
 # Collect diverse trajectories with action noise
+# Use same map with different waypoint configurations
 python training/vel_net/train_vel_net.py collect \
-    --map gate_mid --n_sequences 10 --v_min 0.5 --v_max 2.0 \
+    --map gate_mid --waypoints gate_mid --n_sequences 10 --v_min 0.5 --v_max 2.0 \
     --action_noise 0.1 --output_dir data/vel_net/sequences_diverse
 
 python training/vel_net/train_vel_net.py collect \
-    --map zigzag --n_sequences 10 --v_min 0.5 --v_max 2.0 \
+    --map gate_mid --waypoints zigzag --n_sequences 10 --v_min 0.5 --v_max 2.0 \
     --action_noise 0.1 --output_dir data/vel_net/sequences_diverse
 
 python training/vel_net/train_vel_net.py collect \
-    --map gate_mid_high --n_sequences 10 --v_min 0.5 --v_max 2.0 \
+    --map gate_mid --waypoints gate_mid_high --n_sequences 10 --v_min 0.5 --v_max 2.0 \
     --action_noise 0.1 --output_dir data/vel_net/sequences_diverse
 
 # Collect with waypoint randomization (±0.3m variation per sequence)
 python training/vel_net/train_vel_net.py collect \
-    --map gate_mid --n_sequences 30 --v_min 0.5 --v_max 2.0 \
-    --action_noise 0.1 --waypoint_noise 0.3 \
-    --output_dir data/vel_net/sequences_diverse
+    --map gate_mid --waypoints gate_mid --n_sequences 100 --v_min 0.3 --v_max 1.5 \
+    --action_noise 0.1 --waypoint_noise 0.1 \
+    --output_dir /scr/irislab/ke/data/vel_net/gate_mid_new_veldata
 ```
 
 **Options:**
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--map` | Trajectory name (see below) | `gate_mid` |
+| `--map` | GS/point cloud map name (see below) | from waypoints config |
+| `--waypoints` | Waypoint trajectory configuration (see below) | `gate_mid` |
 | `--n_sequences` | Number of sequences | `30` |
 | `--freq` | Collection frequency (Hz) | `30` |
 | `--v_min` | Min velocity (m/s) | `0.5` |
@@ -113,17 +121,27 @@ python training/vel_net/train_vel_net.py collect \
 | `--preview` | Preview trajectory only (no data collection) | off |
 | `--v_avg` | Average velocity for preview mode | `(v_min+v_max)/2` |
 
-**Available Trajectories:**
-| Trajectory | Description |
-|------------|-------------|
-| `gate_mid` | Through center of gate, default trajectory |
-| `gate_mid_high` | Higher altitude version of gate_mid |
-| `gate_mid_low` | Lower altitude version of gate_mid |
-| `gate_left` | Through left side of gate |
-| `gate_right` | Through right side of gate |
-| `zigzag` | Zigzag pattern with lateral movements |
-| `straight` | Straight line trajectory |
-| `reverse` | Reverse direction of gate_mid |
+**Available GS Maps (`--map`):**
+| Map | Description |
+|-----|-------------|
+| `gate_mid` | Main gate scene (center view) |
+| `gate_left` | Gate scene (left view) |
+| `gate_right` | Gate scene (right view) |
+| `clutter` | Cluttered environment |
+| `backroom` | Backroom scene |
+| `flightroom` | Flight room scene |
+
+**Available Waypoint Trajectories (`--waypoints`):**
+| Trajectory | Default Map | Description |
+|------------|-------------|-------------|
+| `gate_mid` | gate_mid | Through center of gate, default trajectory |
+| `gate_mid_high` | gate_mid | Higher altitude version of gate_mid |
+| `gate_mid_low` | gate_mid | Lower altitude version of gate_mid |
+| `gate_left` | gate_left | Through left side of gate |
+| `gate_right` | gate_mid | Through right side of gate |
+| `zigzag` | gate_mid | Zigzag pattern with lateral movements |
+| `straight` | gate_mid | Straight line trajectory |
+| `reverse` | gate_mid | Reverse direction of gate_mid |
 
 **Note:** If `v_min == v_max`, fixed velocity is used. Otherwise, random velocity is sampled from [v_min, v_max] for each sequence.
 
@@ -153,14 +171,17 @@ data/vel_net/sequences/
 Train the velocity network with curriculum learning:
 
 ```bash
+python training/vel_net/precompute_features.py \
+      --data_dir /scr/irislab/ke/data/vel_net/gate_mid_new_veldata \
+      --device cuda:0
 # Train with wandb logging
  python training/vel_net/train_vel_net.py train \
-      --data_dir data/vel_net/sequences_0106 \
+      --data_dir /scr/irislab/ke/data/vel_net/sequences_0106 \
       --epochs 500 \
       --batch_size 16 \
       --seq_length 32 --stride 16 \
       --tf_start_epoch 10 --tf_end_epoch 60 \
-      --wandb --checkpoint_dir checkpoints/vel_net_0106_norm_v2
+      --wandb --checkpoint_dir /scr/irislab/ke/checkpoints/vel_net_0124_delta
 ```
 
 **Options:**
@@ -216,12 +237,79 @@ Training uses z-score normalization so all axes (vx, vy, vz) contribute equally 
 Test auto-regressive inference:
 
 ```bash
+# Evaluate on specific map and waypoints
 python training/vel_net/train_vel_net.py eval \
       --checkpoint checkpoints/vel_net/best.pt \
       --map gate_mid \
+      --waypoints gate_mid \
       --v_avg 1.0 \
       --output_dir output/vel_net_eval
+
+# Evaluate with different waypoint trajectory
+python training/vel_net/train_vel_net.py eval \
+      --checkpoint checkpoints/vel_net/best.pt \
+      --map gate_mid \
+      --waypoints zigzag \
+      --v_avg 1.5 \
+      --output_dir output/vel_net_eval
 ```
+
+### 4. Verification on Collected Data
+
+Test vel_net on collected simulation or real-world data:
+
+#### Simulation Data Verification
+
+```bash
+# Verify on a single simulation sequence
+python test/verify_sim_data.py \
+    --data_dir /scr/irislab/ke/data/vel_net/gate_mid_new_veldata/seq_0000 \
+    --checkpoint /scr/irislab/ke/checkpoints/vel_net_imu_fusion \
+    --output_dir output/sim_data_verify
+
+# Verify on different sequence
+python test/verify_sim_data.py \
+    --data_dir /scr/irislab/ke/data/vel_net/gate_mid_new_veldata/seq_0010 \
+    --checkpoint /scr/irislab/ke/checkpoints/vel_net_imu_fusion \
+    --output_dir output/sim_verify_seq10
+```
+
+#### Real-World Data Verification
+
+```bash
+# Verify on real-world flight data
+python test/verify_real_world.py \
+    --data_dir test/real_world_vel_data/2026-01-26_02-00-29 \
+    --checkpoint /scr/irislab/ke/checkpoints/vel_net_imu_fusion \
+    --output_dir output/real_world_verify
+```
+
+**Options:**
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--data_dir` | Path to data sequence directory | required |
+| `--checkpoint` | Checkpoint file or directory | required |
+| `--output_dir` | Output directory for plots | `output/*_verify` |
+| `--device` | PyTorch device | `cuda:0` |
+
+**Output Files:**
+| File | Description |
+|------|-------------|
+| `velocity_comparison.png` | 4-panel plot (X, Y, Z, magnitude) comparing GT vs predicted |
+| `error_over_time.png` | Per-axis error evolution over time |
+| `error_distribution.png` | Error histograms and box plots |
+| `trajectory_3d.png` | 3D trajectory with error coloring |
+| `metrics.txt` | Summary metrics (MAE, RMSE, per-axis) |
+| `results.npz` | Raw data for further analysis |
+
+**Data Format Differences:**
+
+| Format | Sim Data | Real-World Data |
+|--------|----------|-----------------|
+| Telemetry | `telemetry.npz` | `fast_state_record.txt`, `fast_action_record.txt` |
+| RGB | `000000.png` | `0001.jpg` |
+| Depth | `000000.npy` | `0000_depth.npy` |
+| Action order | [roll, pitch, yaw, thrust] | [thrust, roll, pitch, yaw] (auto-reordered) |
 
 ---
 
@@ -316,6 +404,11 @@ GRaD_Dynamic_onboard/
 │       ├── evaluator.py              # Evaluation utilities
 │       └── train_vel_net.py          # Main entry point
 │
+├── test/
+│   ├── verify_sim_data.py            # Verify vel_net on simulation data
+│   ├── verify_real_world.py          # Verify vel_net on real-world data
+│   └── real_world_vel_data/          # Real-world flight recordings
+│
 ├── envs/
 │   ├── drone_env.py                  # SimpleDroneEnv (base environment)
 │   └── assets/
@@ -357,16 +450,31 @@ GRaD_Dynamic_onboard/
 
 ## Map/Trajectory Configurations
 
-| Trajectory | Start (PC space) | Waypoints | Destination | Description |
-|------------|------------------|-----------|-------------|-------------|
-| `gate_mid` | [-6, 0, 1.2] | 4 | [7.5, -2, 1.2] | Default center trajectory |
-| `gate_mid_high` | [-6, 0, 1.6] | 4 | [7.5, -2, 1.6] | Higher altitude |
-| `gate_mid_low` | [-6, 0, 0.8] | 4 | [7.5, -2, 0.8] | Lower altitude |
-| `gate_left` | [-6, 0, 1.2] | 3 | [7, -2, 1.2] | Left side of gate |
-| `gate_right` | [-6, 0, 1.3] | 5 | [7, -2, 1.3] | Right side of gate |
-| `zigzag` | [-6, 0, 1.2] | 6 | [7.5, -2, 1.2] | Lateral zigzag |
-| `straight` | [-6, 0, 1.2] | 4 | [7.5, 0, 1.2] | Straight line |
-| `reverse` | [7.5, -2, 1.2] | 4 | [-6, 0, 1.2] | Reverse of gate_mid |
+### GS/Point Cloud Maps (`--map`)
+
+| Map | Folder | Description |
+|-----|--------|-------------|
+| `gate_mid` | gate_mid_new | Main gate scene (center view) |
+| `gate_left` | sv_917_3_left_nerfstudio | Gate scene (left view) |
+| `gate_right` | sv_917_3_right_nerfstudio | Gate scene (right view) |
+| `clutter` | sv_712_nerfstudio | Cluttered environment |
+| `backroom` | sv_1018_2 | Backroom scene |
+| `flightroom` | sv_1018_3 | Flight room scene |
+
+### Waypoint Trajectories (`--waypoints`)
+
+| Trajectory | Default Map | Start (PC space) | Waypoints | Destination | Description |
+|------------|-------------|------------------|-----------|-------------|-------------|
+| `gate_mid` | gate_mid | [-6, 0, 1.2] | 4 | [7.5, -2, 1.2] | Default center trajectory |
+| `gate_mid_high` | gate_mid | [-6, 0, 1.6] | 4 | [7.5, -2, 1.6] | Higher altitude |
+| `gate_mid_low` | gate_mid | [-6, 0, 0.8] | 4 | [7.5, -2, 0.8] | Lower altitude |
+| `gate_left` | gate_left | [-6, 0, 1.2] | 3 | [7, -2, 1.2] | Left side of gate |
+| `gate_right` | gate_mid | [-6, 0, 1.3] | 5 | [7, -2, 1.3] | Right side of gate |
+| `zigzag` | gate_mid | [-6, 0, 1.2] | 6 | [7.5, -2, 1.2] | Lateral zigzag |
+| `straight` | gate_mid | [-6, 0, 1.2] | 4 | [7.5, 0, 1.2] | Straight line |
+| `reverse` | gate_mid | [7.5, -2, 1.2] | 4 | [-6, 0, 1.2] | Reverse of gate_mid |
+
+**Note:** If `--map` is not specified, the default map from the waypoint config is used.
 
 
 # GRaD Nav policy

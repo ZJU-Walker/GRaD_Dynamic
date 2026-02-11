@@ -832,22 +832,39 @@ class GradNav:
     def save(self, filename = None):
         if filename is None:
             filename = 'best_policy'
-        # Save privilege_obs_rms as well for proper training resumption
-        torch.save([self.actor, self.critic, self.target_critic, self.obs_rms, self.vae, self.env.visual_net, self.privilege_obs_rms], os.path.join(self.log_dir, "{}.pt".format(filename)))
+        # Portable state_dict format
+        portable_checkpoint = {
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'target_critic_state_dict': self.target_critic.state_dict(),
+            'obs_rms': self.obs_rms,
+            'vae_state_dict': self.vae.state_dict(),
+            'visual_net_state_dict': self.env.visual_net.state_dict(),
+            'privilege_obs_rms': self.privilege_obs_rms,
+            'actor_class': type(self.actor).__name__,
+            'critic_class': type(self.critic).__name__,
+            'vae_class': type(self.vae).__name__,
+            'visual_net_class': type(self.env.visual_net).__name__,
+        }
+        torch.save(portable_checkpoint, os.path.join(self.log_dir, "{}.pt".format(filename)))
 
     def load(self, path):
         print(path)
-        checkpoint = torch.load(path)
-        self.actor = checkpoint[0].to(self.device)
-        self.critic = checkpoint[1].to(self.device)
-        self.target_critic = checkpoint[2].to(self.device)
-        self.obs_rms = checkpoint[3].to(self.device)
-        self.vae = checkpoint[4].to(self.device)
-        self.env.visual_net = checkpoint[5].to(self.device)
-        # Load privilege_obs_rms if available (backwards compatible with old checkpoints)
-        if len(checkpoint) > 6 and checkpoint[6] is not None:
-            self.privilege_obs_rms = checkpoint[6].to(self.device)
+        checkpoint = torch.load(path, map_location=self.device)
+
+        # Portable state_dict format
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.target_critic.load_state_dict(checkpoint['target_critic_state_dict'])
+
+        if 'obs_rms' in checkpoint and checkpoint['obs_rms'] is not None:
+            self.obs_rms = checkpoint['obs_rms'].to(self.device)
+
+        self.vae.load_state_dict(checkpoint['vae_state_dict'])
+        self.env.visual_net.load_state_dict(checkpoint['visual_net_state_dict'])
+
+        if 'privilege_obs_rms' in checkpoint and checkpoint['privilege_obs_rms'] is not None:
+            self.privilege_obs_rms = checkpoint['privilege_obs_rms'].to(self.device)
             print_info(f"privilege_obs_rms loaded from checkpoint")
-        else:
-            print_info(f"Warning: privilege_obs_rms not in checkpoint, using freshly initialized")
+
         print_info(f"all nets have been loaded")
