@@ -38,7 +38,7 @@ params:
 
   config:
     name: gradnav_test
-    map_name: gate_mid
+    map_name: gate_mid_new
     actor_learning_rate: 1e-4
     critic_learning_rate: 1e-4
     vae_learning_rate: 5e-4
