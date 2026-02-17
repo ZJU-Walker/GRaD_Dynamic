@@ -556,7 +556,7 @@ python examples/train_gradnav_dynamic.py \
 ```bash
 python examples/train_gradnav_dynamic.py \
       --cfg examples/cfg/gradnav/drone_dynamic_curriculum.yaml \
-      --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/gradnav_test_0212/gate_mid_new/02-12-2026-17-28-39/best_policy.pt \
+      --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/gradnav_dynamic_0216_using_vel_cuda_1_v1/gate_mid_new/02-16-2026-15-45-01/best_policy.pt \
       --play --render
 ```
 
