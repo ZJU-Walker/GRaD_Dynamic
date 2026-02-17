@@ -27,6 +27,9 @@ from utils.time_report import TimeReport
 from models.policy.squeeze_net import VisualPerceptionNet
 from models.vel_net import VELO_NET, DualEncoder
 from models.vel_net.vel_obs_utils import quaternion_to_rot6d, build_vel_observation
+from models.vel_net_body import VELO_NET_BODY
+from models.vel_net_body.vel_obs_utils_body import quaternion_to_rot6d as quaternion_to_rot6d_body
+from models.vel_net_body.vel_obs_utils_body import transform_worldvel_to_bodyvel
 
 
 class ExpertDroneEnv(SimpleDroneEnv):
@@ -88,6 +91,8 @@ class ExpertDroneEnv(SimpleDroneEnv):
 
         # Config
         self.cfg = get_config(map_name)
+        # Override episode_length from constructor parameter (YAML config)
+        self.cfg.episode_length = episode_length
 
         # Load reward parameters from config (lines 172-195 in original)
         self.heading_strength = self.cfg.heading_strength
@@ -129,6 +134,11 @@ class ExpertDroneEnv(SimpleDroneEnv):
         self.vel_net_cfg = vel_net_cfg if vel_net_cfg is not None else {}
         self.vel_net_enabled = self.vel_net_cfg.get('enabled', False)
         self.vel_net_eval_compare = self.vel_net_cfg.get('eval_compare', True)
+
+        # Get velocity frame setting (body or world) - applies to both vel_net and policy
+        self.vel_frame = self.vel_net_cfg.get('vel_frame', 'body')
+        assert self.vel_frame in ['body', 'world'], f"Invalid vel_frame: {self.vel_frame}. Must be 'body' or 'world'."
+        print(f"[Policy] Velocity frame: {self.vel_frame}")
 
         if self.vel_net_enabled:
             self._init_vel_net()
@@ -309,20 +319,30 @@ class ExpertDroneEnv(SimpleDroneEnv):
 
         # Load model config
         model_config = checkpoint.get('model_config', checkpoint.get('config', {}))
-        num_obs = model_config.get('num_obs', 84)
+        num_obs = model_config.get('num_obs', 76)
         hidden_dim = model_config.get('hidden_dim', 256)
         gru_layers = model_config.get('gru_layers', 3)
         dt = model_config.get('dt', 1.0 / 30.0)
 
-        # Initialize VELO_NET
-        self.vel_net = VELO_NET(
-            num_obs=num_obs,
-            stack_size=1,
-            hidden_dim=hidden_dim,
-            gru_layers=gru_layers,
-            dt=dt,
-            device=self.device
-        ).to(self.device)
+        # Initialize velocity network based on frame setting
+        if self.vel_frame == 'body':
+            self.vel_net = VELO_NET_BODY(
+                num_obs=num_obs,
+                stack_size=1,
+                hidden_dim=hidden_dim,
+                gru_layers=gru_layers,
+                dt=dt,
+                device=self.device
+            ).to(self.device)
+        else:  # world frame
+            self.vel_net = VELO_NET(
+                num_obs=num_obs,
+                stack_size=1,
+                hidden_dim=hidden_dim,
+                gru_layers=gru_layers,
+                dt=dt,
+                device=self.device
+            ).to(self.device)
         self.vel_net.load_state_dict(checkpoint['model_state_dict'])
         self.vel_net.eval()
 
@@ -343,11 +363,13 @@ class ExpertDroneEnv(SimpleDroneEnv):
         # Load normalization stats
         self.vel_mean = checkpoint.get('vel_mean', torch.zeros(3)).to(self.device)
         self.vel_std = checkpoint.get('vel_std', torch.ones(3)).to(self.device)
+        self.accel_mean = checkpoint.get('accel_mean', torch.zeros(3)).to(self.device)
+        self.accel_std = checkpoint.get('accel_std', torch.ones(3)).to(self.device)
         self.delta_mean = checkpoint.get('delta_mean', torch.zeros(3)).to(self.device)
         self.delta_std = checkpoint.get('delta_std', torch.ones(3)).to(self.device)
 
         # Initialize vel_net buffers
-        self.vel_net_obs = torch.zeros([self.num_envs, 84], device=self.device)
+        self.vel_net_obs = torch.zeros([self.num_envs, 76], device=self.device)
         self.pred_vel_prev = torch.zeros([self.num_envs, 3], device=self.device)
         self.pred_vel_current = torch.zeros([self.num_envs, 3], device=self.device)
 
@@ -373,9 +395,24 @@ class ExpertDroneEnv(SimpleDroneEnv):
         self.vel_net_finetune_encoder = self.vel_net_cfg.get('finetune_encoder', True)
         self.vel_net_finetuning_active = False  # Will be set to True when fine-tuning starts
 
+        # GT→pred velocity curriculum config
+        # Controls transition from using GT velocity to predicted velocity in policy observations
+        self.use_pred_vel_in_obs = self.vel_net_cfg.get('use_pred_vel_in_obs', False)
+        self.gt_vel_ratio = 1.0  # Current ratio: 1.0 = 100% GT, 0.0 = 100% pred
+        self.gt_vel_curriculum_start = self.vel_net_cfg.get('gt_vel_curriculum_start_iter', 0)
+        self.gt_vel_curriculum_end = self.vel_net_cfg.get('gt_vel_curriculum_end_iter', 200)
+        self.gt_vel_ratio_start = self.vel_net_cfg.get('gt_vel_ratio_start', 1.0)  # Start with 100% GT
+        self.gt_vel_ratio_end = self.vel_net_cfg.get('gt_vel_ratio_end', 0.0)  # End with 0% GT (100% pred)
+
+        # Store predicted velocity for use in observations
+        self.vel_net_pred_vel = torch.zeros([self.num_envs, 3], device=self.device)
+
         print(f"[vel_net] Initialized: num_obs={num_obs}, hidden_dim={hidden_dim}, dt={dt:.4f}")
         if self.vel_net_finetune:
             print(f"[vel_net] Fine-tuning enabled: start_iter={self.vel_net_finetune_start_iter}, lr={self.vel_net_lr}")
+        if self.use_pred_vel_in_obs:
+            print(f"[vel_net] GT→pred curriculum: iter {self.gt_vel_curriculum_start}-{self.gt_vel_curriculum_end}, "
+                  f"ratio {self.gt_vel_ratio_start:.1f}→{self.gt_vel_ratio_end:.1f}")
 
     def enable_vel_net_finetuning(self):
         """Enable fine-tuning by unfreezing vel_net and optionally DualEncoder."""
@@ -407,6 +444,46 @@ class ExpertDroneEnv(SimpleDroneEnv):
 
         self.vel_net_finetuning_active = True
         print(f"[vel_net] Fine-tuning active. Trainable params: {self.count_vel_net_trainable_params()}")
+
+    def update_gt_vel_curriculum(self, current_iter: int):
+        """
+        Update GT velocity ratio based on current iteration.
+
+        Linearly interpolates from gt_vel_ratio_start to gt_vel_ratio_end
+        between curriculum_start and curriculum_end iterations.
+        """
+        if not self.vel_net_enabled or not self.use_pred_vel_in_obs:
+            return
+
+        if current_iter < self.gt_vel_curriculum_start:
+            self.gt_vel_ratio = self.gt_vel_ratio_start
+        elif current_iter >= self.gt_vel_curriculum_end:
+            self.gt_vel_ratio = self.gt_vel_ratio_end
+        else:
+            # Linear interpolation
+            progress = (current_iter - self.gt_vel_curriculum_start) / \
+                       (self.gt_vel_curriculum_end - self.gt_vel_curriculum_start)
+            self.gt_vel_ratio = self.gt_vel_ratio_start + \
+                               progress * (self.gt_vel_ratio_end - self.gt_vel_ratio_start)
+
+    def get_blended_velocity(self, gt_vel: torch.Tensor) -> torch.Tensor:
+        """
+        Get blended velocity based on current GT ratio.
+
+        Both GT and predicted velocities are in the same frame (body or world, based on vel_frame).
+
+        Args:
+            gt_vel: Ground truth velocity (N, 3) - frame matches vel_frame setting
+
+        Returns:
+            Blended velocity: gt_vel_ratio * gt_vel + (1 - gt_vel_ratio) * pred_vel
+        """
+        if not self.vel_net_enabled or not self.use_pred_vel_in_obs:
+            return gt_vel
+
+        # Blend GT and predicted velocity (both in same frame)
+        blended = self.gt_vel_ratio * gt_vel + (1.0 - self.gt_vel_ratio) * self.vel_net_pred_vel
+        return blended
 
     def get_vel_net_trainable_params(self):
         """Get trainable parameters for vel_net optimizer."""
@@ -442,7 +519,7 @@ class ExpertDroneEnv(SimpleDroneEnv):
             return torch.tensor(0.0, device=self.device)
 
         # Stack buffered data
-        obs_batch = torch.stack(self.vel_net_train_buffer['obs'], dim=0)  # (T, N, 84)
+        obs_batch = torch.stack(self.vel_net_train_buffer['obs'], dim=0)  # (T, N, 76)
         gt_vel_batch = torch.stack(self.vel_net_train_buffer['gt_vel'], dim=0)  # (T, N, 3)
 
         T, N, _ = obs_batch.shape
@@ -454,11 +531,11 @@ class ExpertDroneEnv(SimpleDroneEnv):
 
         # Sequential forward pass with gradients
         for t in range(T):
-            obs_t = obs_batch[t]  # (N, 84)
+            obs_t = obs_batch[t]  # (N, 76)
             gt_vel_t = gt_vel_batch[t]  # (N, 3)
 
             # Get acceleration from obs (last 3 dims)
-            accel_t = obs_t[:, 81:84]
+            accel_t = obs_t[:, 73:76]
 
             # Forward through vel_net (with gradients)
             correction_mu, _ = self.vel_net.encode_step(obs_t)
@@ -550,57 +627,65 @@ class ExpertDroneEnv(SimpleDroneEnv):
         print(f"[vel_net] Saved velocity comparison plot to {save_path}")
         print(f"[vel_net] MAE: {mae:.4f} m/s over {T} steps")
 
-    def _build_vel_net_obs_and_infer(self, torso_quat, lin_vel, lin_acceleration):
+    def _build_vel_net_obs_and_infer(self, torso_quat, lin_vel_body, lin_vel_world, lin_acceleration):
         """Build vel_net observation and run inference for evaluation comparison.
+
+        Velocities are in BODY FRAME for vel_net_body, WORLD FRAME for vel_net.
 
         Args:
             torso_quat: Quaternion (N, 4) in xyzw format
-            lin_vel: Ground truth linear velocity (N, 3) - used for tracking
-            lin_acceleration: Linear acceleration (N, 3) - used as IMU input
+            lin_vel_body: Ground truth linear velocity in body frame (N, 3)
+            lin_vel_world: Ground truth linear velocity in world frame (N, 3)
+            lin_acceleration: Linear acceleration (N, 3) - used as IMU input (world frame)
         """
+        # Select velocity based on frame setting
+        gt_vel = lin_vel_body if self.vel_frame == 'body' else lin_vel_world
+
         # Convert quaternion to rot6d (detach to avoid sharing graph with actor)
         rot6d = quaternion_to_rot6d(torso_quat.detach())  # (N, 6)
 
         # Normalize previous predicted velocity for input
         prev_vel_normalized = (self.pred_vel_prev - self.vel_mean) / (self.vel_std + 1e-8)
 
-        # Build vel_net observation (84 dims)
+        # Normalize acceleration for input
+        accel_normalized = (lin_acceleration.detach() - self.accel_mean) / (self.accel_std + 1e-8)
+
+        # Build vel_net observation (76 dims, no action)
         # Detach inputs to ensure vel_net has its own computation graph separate from actor
         self.vel_net_obs = build_vel_observation(
             rot6d=rot6d,                                    # 0:6
-            action=self.actions.detach(),                   # 6:10
-            prev_action=self.prev_actions.detach(),         # 10:14
-            prev_vel=prev_vel_normalized,                   # 14:17 (normalized)
-            rgb_feat=self.rgb_feat_vel.detach(),            # 17:49
-            depth_feat=self.depth_feat_vel.detach(),        # 49:81
-            accel=lin_acceleration.detach(),                # 81:84 (IMU)
+            prev_vel=prev_vel_normalized,                   # 6:9 (normalized)
+            rgb_feat=self.rgb_feat_vel.detach(),            # 9:41
+            depth_feat=self.depth_feat_vel.detach(),        # 41:73
+            accel=accel_normalized,                         # 73:76 (normalized IMU)
         )
 
         # Store data for vel_net training (if fine-tuning enabled)
         if self.vel_net_finetuning_active:
             self.vel_net_train_buffer['obs'].append(self.vel_net_obs.detach().clone())
-            self.vel_net_train_buffer['gt_vel'].append(lin_vel.detach().clone())
+            self.vel_net_train_buffer['gt_vel'].append(gt_vel.detach().clone())
             # vel_physics will be computed fresh during training
 
         # Run vel_net inference (always without gradients during rollout)
         with torch.no_grad():
-            correction_mu, _ = self.vel_net.encode_step(self.vel_net_obs)
+            delta_v_mu, _ = self.vel_net.encode_step(self.vel_net_obs)
 
-        # Denormalize correction
-        correction = correction_mu * self.delta_std + self.delta_mean
+        # Denormalize delta_v (direct delta-v mode)
+        delta_v = delta_v_mu * self.delta_std + self.delta_mean
 
-        # Physics-informed fusion: vel_pred = prev_vel + accel * dt + correction
-        vel_physics = self.pred_vel_prev + lin_acceleration.detach() * self.vel_net.dt
-        self.pred_vel_current = vel_physics + correction
+        # Direct delta-v: vel_pred = prev_vel + delta_v (no physics integration)
+        self.pred_vel_current = self.pred_vel_prev + delta_v
 
         # Update previous predicted velocity for next step (auto-regressive)
         with torch.no_grad():
             self.pred_vel_prev = self.pred_vel_current.clone().detach()
+            # Store predicted velocity for use in policy observations (GT→pred curriculum)
+            self.vel_net_pred_vel = self.pred_vel_current.clone().detach()
 
         # Track velocities for evaluation comparison (only during visualization/eval)
         if self.visualize and self.vel_net_eval_compare:
             # Store only first environment's data for plotting
-            self.gt_vel_history.append(lin_vel[0].detach().cpu().numpy().copy())
+            self.gt_vel_history.append(gt_vel[0].detach().cpu().numpy().copy())
             self.pred_vel_history.append(self.pred_vel_current[0].detach().cpu().numpy().copy())
 
     def step(self, actions, vae_info):
@@ -688,6 +773,8 @@ class ExpertDroneEnv(SimpleDroneEnv):
                 'privilege_obs_before_reset': self.privilege_obs_buf_before_reset,
                 'episode_end': self.termination_buf,
             }
+        else:
+            self.extras = {}
 
         if len(env_ids) > 0:
             self.reset(env_ids)
@@ -756,6 +843,7 @@ class ExpertDroneEnv(SimpleDroneEnv):
             self.state_joint_q.view(self.num_envs, -1)[env_ids, 3:7] = self.start_rotation.clone()
             self.state_joint_qd.view(self.num_envs, -1)[env_ids, :] = 0.
             self.state_joint_qdd.view(self.num_envs, -1)[env_ids, :] = 0.
+            self.prev_lin_vel[env_ids, :] = 0.  # Reset previous velocity for acceleration computation
             self.actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
             self.prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
             self.prev_prev_actions.view(self.num_envs, -1)[env_ids, :] = self.start_joint_q.clone()
@@ -806,13 +894,15 @@ class ExpertDroneEnv(SimpleDroneEnv):
         self.visual_info = self.visual_net(visual_tensor).detach()
 
         # Process through DualEncoder for vel_net (if enabled)
+        # IMPORTANT: Use RAW images (no resize) to match training data / evaluator
+        # The DualEncoder has internal adaptive pooling so it handles any input size
         if self.vel_net_enabled and self.dual_encoder is not None:
             with torch.no_grad():
-                # RGB: already (B, 3, H, W) format after permute
-                # Depth: need to convert to (B, 1, H, W)
-                depth_tensor = depth_list.permute(0, 3, 1, 2)  # (B, H, W, 1) -> (B, 1, H, W)
-                depth_tensor = resize(depth_tensor).to(self.device)
-                self.rgb_feat_vel, self.depth_feat_vel = self.dual_encoder(visual_tensor, depth_tensor)
+                # RGB: raw render output (B, H, W, 3) -> (B, 3, H, W), NO resize
+                rgb_raw = rgb_img.permute(0, 3, 1, 2).to(self.device)
+                # Depth: raw render output (B, H, W, 1) -> (B, 1, H, W), NO resize
+                depth_raw = depth_list.permute(0, 3, 1, 2).to(self.device)
+                self.rgb_feat_vel, self.depth_feat_vel = self.dual_encoder(rgb_raw, depth_raw)
 
     def calculateObservations(self):
         """
@@ -822,10 +912,19 @@ class ExpertDroneEnv(SimpleDroneEnv):
         """
         torso_pos = self.state_joint_q.view(self.num_envs, -1)[:, 0:3]
         torso_quat = self.state_joint_q.view(self.num_envs, -1)[:, 3:7]  # (x,y,z,w)
-        lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6]
+        lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6]  # world frame
         ang_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 0:3]
-        lin_acceleration = self.state_joint_qdd.view(self.num_envs, -1)[:, 3:6]
 
+        # Compute acceleration from velocity derivative (matches training data)
+        # This is more accurate for vel_net than using state_joint_qdd
+        lin_acceleration = (lin_vel - self.prev_lin_vel) / self.dt
+        self.prev_lin_vel = lin_vel.clone().detach()
+
+        # Convert velocity to body frame for policy observations
+        # Detach to avoid gradient flow issues (obs doesn't need gradients through this transform)
+        lin_vel_body = transform_worldvel_to_bodyvel(lin_vel.detach(), torso_quat.detach())
+
+        # Keep target_dirs in world frame for heading alignment with world-frame targets
         target_dirs = tu.normalize(lin_vel[:, 0:2].clone())
         up_vec = tu.quat_rotate(torso_quat.clone(), self.up_vec)
         rpy = quaternion_to_euler(torso_quat[:, [3, 0, 2, 1]])  # input is (w,x,z,y)
@@ -858,15 +957,18 @@ class ExpertDroneEnv(SimpleDroneEnv):
 
         # Adding noise (lines 628-632)
         torso_pos_noise = self.obs_noise_level * (torch.rand_like(torso_pos) - 0.5)
-        lin_vel_noise = self.obs_noise_level * (torch.rand_like(lin_vel) - 0.5)
+        lin_vel_noise = self.obs_noise_level * (torch.rand_like(lin_vel_body) - 0.5)  # body frame noise
         visual_noise = self.obs_noise_level * (torch.rand_like(self.visual_info) - 0.5)
         latent_noise = self.obs_noise_level * (torch.rand_like(self.latent_vect) - 0.5)
         torso_quat_noise = self.obs_noise_level * (torch.rand_like(torso_quat) - 0.5)
 
+        # Select velocity for privilege_obs based on frame setting
+        priv_vel = lin_vel_body if self.vel_frame == 'body' else lin_vel
+
         # privilege_obs_buf (lines 634-648)
         self.privilege_obs_buf = torch.cat([
             torso_pos[:, :],                                              # 0:3
-            lin_vel,                                                      # 3:6 
+            priv_vel,                                                     # 3:6 (body or world frame)
             lin_acceleration,                                             # 6:9
             torso_quat,                                                   # 9:13
             ang_vel,                                                      # 13:16
@@ -879,14 +981,34 @@ class ExpertDroneEnv(SimpleDroneEnv):
             self.latent_vect,                                             # 43:67
         ], dim=-1)
 
+        # vel_net observation and inference (BEFORE obs_buf so we can use pred_vel)
+        # Pass both body and world frame GT velocities
+        if self.vel_net_enabled and self.vel_net is not None:
+            self._build_vel_net_obs_and_infer(torso_quat, lin_vel_body, lin_vel, lin_acceleration)
+
+        # Select GT velocity based on frame setting for policy observation
+        gt_vel_for_obs = lin_vel_body if self.vel_frame == 'body' else lin_vel
+
+        # Get velocity for policy observation (GT→pred curriculum)
+        # Velocity frame matches vel_frame setting (body or world)
+        # When using predicted velocity, no noise is added (pred already has uncertainty)
+        if self.vel_net_enabled and self.use_pred_vel_in_obs:
+            # Both GT and predicted are in the same frame (body or world)
+            obs_vel = self.get_blended_velocity(gt_vel_for_obs)
+            obs_vel_z = obs_vel[:, 2:3]
+        else:
+            # Use GT velocity with noise (in configured frame)
+            obs_vel = gt_vel_for_obs
+            obs_vel_z = (gt_vel_for_obs[:, 2] + lin_vel_noise[:, 2]).unsqueeze(-1)
+
         # obs_buf (lines 650-660)
         self.obs_buf = torch.cat([
             (torso_pos[:, 2] + torso_pos_noise[:, 2]).unsqueeze(-1),      # 0 z-pos
-            (lin_vel[:, 2] + lin_vel_noise[:, 2]).unsqueeze(-1),          # 1 z-vel TODO Change to vel_net
+            obs_vel_z,                                                    # 1 z-vel (GT+noise or blended)
             torso_quat + torso_quat_noise,                                # 2:6
             self.actions,                                                 # 6:10
             self.prev_actions,                                            # 10:14
-            lin_vel,                                                      # 14:17 TODO Change to vel_net
+            obs_vel,                                                      # 14:17 (GT or blended)
             self.visual_info + visual_noise,                              # 17:33
             self.latent_vect + latent_noise,                              # 33:57
         ], dim=-1)
@@ -894,18 +1016,14 @@ class ExpertDroneEnv(SimpleDroneEnv):
         # vae_obs_buf (lines 663-673)
         self.vae_obs_buf = torch.cat([
             (torso_pos[:, 2] + torso_pos_noise[:, 2]).unsqueeze(-1),      # 0 z-pos
-            (lin_vel[:, 2] + lin_vel_noise[:, 2]).unsqueeze(-1),          # 1 z-vel
+            obs_vel_z,                                                    # 1 z-vel (GT+noise or blended)
             torso_quat + torso_quat_noise,                                # 2:6
             self.actions,                                                 # 6:10
             self.prev_actions,                                            # 10:14
-            lin_vel,                                                      # 14:17 TODO Change to vel_net
+            obs_vel,                                                      # 14:17 (GT or blended)
             self.visual_info + visual_noise,                              # 17:33
             latent_abalation,                                             # 33:57
         ], dim=-1)
-
-        # vel_net observation and inference (for evaluation comparison)
-        if self.vel_net_enabled and self.vel_net is not None:
-            self._build_vel_net_obs_and_infer(torso_quat, lin_vel, lin_acceleration)
             
         # Sanity check (lines 676-684)
         if (torch.isnan(self.obs_buf).any() | torch.isinf(self.obs_buf).any()):
@@ -924,7 +1042,7 @@ class ExpertDroneEnv(SimpleDroneEnv):
 
         Source: lines 687-795
         """
-        self.rew_buf = calculate_reward(
+        self.rew_buf, self.reward_components = calculate_reward(
             obs_buf=self.obs_buf,
             privilege_obs_buf=self.privilege_obs_buf,
             prev_prev_actions=self.prev_prev_actions,
@@ -937,6 +1055,8 @@ class ExpertDroneEnv(SimpleDroneEnv):
             point_cloud_offset=self.point_cloud_offset,
             num_envs=self.num_envs,
             device=self.device,
+            vel_frame=self.vel_frame,
+            return_components=True,
         )
 
         # Check termination (lines 775-790)
