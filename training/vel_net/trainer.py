@@ -75,6 +75,7 @@ class VelNetTrainer:
         grad_clip: float = 1.0,
         tf_start_epoch: int = 0,
         tf_end_epoch: int = 100,
+        grad_accumulation_steps: int = 1,
         device: str = 'cuda:0',
         checkpoint_dir: str = 'checkpoints/vel_net',
         use_wandb: bool = False,
@@ -108,6 +109,7 @@ class VelNetTrainer:
         self.grad_clip = grad_clip
         self.tf_start_epoch = tf_start_epoch
         self.tf_end_epoch = tf_end_epoch
+        self.grad_accumulation_steps = grad_accumulation_steps
 
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -307,6 +309,11 @@ class VelNetTrainer:
         # Use AMP for faster training
         scaler = torch.cuda.amp.GradScaler()
 
+        # Gradient accumulation
+        self.optimizer.zero_grad()
+        accumulated_loss = 0.0
+        batch_idx = 0
+
         for batch in self.train_loader:
             batch_loss = 0.0
             batch_vel_error = 0.0
@@ -357,11 +364,9 @@ class VelNetTrainer:
 
                     # Sequential GRU loop (needed for scheduled sampling)
                     for t in range(seq_length):
-                        # Build observation with normalized IMU accel (84 dims)
+                        # Build observation with normalized IMU accel (76 dims, no action)
                         obs = torch.cat([
                             rot6d_all[t:t+1],
-                            actions[t:t+1],
-                            prev_actions[t:t+1],
                             prev_vel_norm.unsqueeze(0),  # Normalized prev_vel as input
                             rgb_feat_all[t:t+1],
                             depth_feat_all[t:t+1],
@@ -405,17 +410,25 @@ class VelNetTrainer:
 
             if batch_frames > 0:
                 avg_loss = batch_loss / batch_frames
-                self.optimizer.zero_grad()
-                scaler.scale(avg_loss).backward()
-                scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    list(self.model.parameters()) + list(self.encoder.get_trainable_params()),
-                    self.grad_clip
-                )
-                scaler.step(self.optimizer)
-                scaler.update()
-                total_loss += avg_loss.item()
+                # Scale loss for gradient accumulation
+                scaled_loss = avg_loss / self.grad_accumulation_steps
+                scaler.scale(scaled_loss).backward()
+                accumulated_loss += avg_loss.item()
                 total_vel_error += batch_vel_error / batch_frames
+                batch_idx += 1
+
+                # Update weights every grad_accumulation_steps batches
+                if batch_idx % self.grad_accumulation_steps == 0:
+                    scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.model.parameters()) + list(self.encoder.get_trainable_params()),
+                        self.grad_clip
+                    )
+                    scaler.step(self.optimizer)
+                    scaler.update()
+                    self.optimizer.zero_grad()
+                    total_loss += accumulated_loss / self.grad_accumulation_steps
+                    accumulated_loss = 0.0
 
             if pbar is not None:
                 pbar.update(1)
@@ -423,6 +436,18 @@ class VelNetTrainer:
                     'loss': f'{total_loss / max(1, n_sequences // len(batch["seq_paths"])):.4f}',
                     'tf': f'{tf_ratio:.2f}',
                 })
+
+        # Handle remaining accumulated gradients
+        if batch_idx % self.grad_accumulation_steps != 0 and accumulated_loss > 0:
+            scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.parameters()) + list(self.encoder.get_trainable_params()),
+                self.grad_clip
+            )
+            scaler.step(self.optimizer)
+            scaler.update()
+            self.optimizer.zero_grad()
+            total_loss += accumulated_loss / (batch_idx % self.grad_accumulation_steps)
 
         n_batches = len(self.train_loader)
         total_frames = total_tf_frames + total_pred_frames
@@ -489,11 +514,9 @@ class VelNetTrainer:
                 rot6d_all = quaternion_to_rot6d(orientations)
 
                 for t in range(seq_length):
-                    # Build observation with normalized accel (84 dims)
+                    # Build observation with normalized accel (76 dims, no action)
                     obs = torch.cat([
                         rot6d_all[t:t+1],
-                        actions[t:t+1],
-                        prev_actions[t:t+1],
                         prev_vel_norm.unsqueeze(0),  # Normalized input
                         rgb_feat_all[t:t+1],
                         depth_feat_all[t:t+1],
@@ -744,8 +767,8 @@ def autoregressive_test(
             accel = torch.from_numpy(accel_gt[t].astype(np.float32)).unsqueeze(0).to(device)
             accel_norm = (accel - accel_mean) / accel_std
 
-            # Build observation with normalized accel (84 dims)
-            obs = torch.cat([rot6d, action, prev_action, prev_vel_norm.unsqueeze(0), rgb_feat, depth_feat, accel_norm], dim=1)
+            # Build observation with normalized accel (76 dims, no action)
+            obs = torch.cat([rot6d, prev_vel_norm.unsqueeze(0), rgb_feat, depth_feat, accel_norm], dim=1)
 
             # Model outputs delta_v (normalized)
             delta_v_mu_norm, _ = model.encode_step(obs)

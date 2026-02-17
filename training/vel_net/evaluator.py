@@ -311,7 +311,6 @@ def fly_and_evaluate(
     # Keep both raw (for residual calc) and normalized (for model input)
     prev_vel_raw = torch.zeros(3, device=device)
     prev_vel_norm = (prev_vel_raw - vel_mean) / vel_std
-    prev_action = torch.zeros(1, 4, device=device)
 
     # Track previous GT velocity for IMU acceleration computation
     prev_vel_gt = np.zeros(3)
@@ -406,8 +405,6 @@ def fly_and_evaluate(
                 quat_tensor = torch.from_numpy(quat_xyzw.astype(np.float32)).unsqueeze(0).to(device)
                 rot6d = quaternion_to_rot6d(quat_tensor)
 
-                action_tensor = torch.from_numpy(action.astype(np.float32)).unsqueeze(0).to(device)
-
                 # Compute IMU acceleration from GT velocity derivative
                 accel_gt = (vel_gt - prev_vel_gt) / model_dt
 
@@ -428,8 +425,6 @@ def fly_and_evaluate(
 
                 obs = torch.cat([
                     rot6d,           # 6
-                    action_tensor,   # 4
-                    prev_action,     # 4
                     prev_vel_norm.unsqueeze(0),   # 3 (normalized)
                     rgb_feat,        # 32
                     depth_feat,      # 32
@@ -455,9 +450,6 @@ def fly_and_evaluate(
 
         # Always update prev_vel_gt for next acceleration computation (even during stabilization)
         prev_vel_gt = vel_gt.copy()
-
-        # Update prev_action for next step
-        prev_action = torch.from_numpy(action.astype(np.float32)).unsqueeze(0).to(device)
 
         # Record frame for video
         if step % 2 == 0:

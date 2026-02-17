@@ -99,18 +99,23 @@ def train_command(args):
     encoder = DualEncoder(rgb_dim=32, depth_dim=32).to(device)
     print(f"Encoder created: {encoder.num_trainable_params():,} trainable params")
 
+    # Convert seq_length=0 to None for full sequences
+    seq_length = args.seq_length if args.seq_length > 0 else None
+    stride = args.stride if args.seq_length > 0 else None
+    print(f"  Seq length: {seq_length if seq_length else 'full'}, Stride: {stride}")
+
     # Create dataloaders
     train_loader, val_loader = create_dataloaders(
         data_dir=args.data_dir,
-        seq_length=args.seq_length,
-        stride=args.stride,
+        seq_length=seq_length,
+        stride=stride,
         batch_size=args.batch_size,
         val_ratio=args.val_ratio,
     )
 
-    # Create model (84 dims with IMU fusion)
+    # Create model (76 dims: rot6d=6 + prev_vel=3 + rgb=32 + depth=32 + accel=3)
     model = VELO_NET(
-        num_obs=84,  # 81 + 3 for IMU accel
+        num_obs=76,  # No action, compatible with vel_net_body data format
         stack_size=1,
         num_latent=args.num_latent,
         hidden_dim=args.hidden_dim,
@@ -130,6 +135,7 @@ def train_command(args):
         grad_clip=args.grad_clip,
         tf_start_epoch=args.tf_start_epoch,
         tf_end_epoch=args.tf_end_epoch,
+        grad_accumulation_steps=args.grad_accum,
         device=device,
         checkpoint_dir=args.checkpoint_dir,
         use_wandb=args.wandb,
@@ -310,7 +316,7 @@ def main():
     collect_parser.add_argument('--output_dir', type=str, default='data/vel_net/sequences',
                                 help='Output directory for sequences')
     collect_parser.add_argument('--map', type=str, default=None,
-                                choices=['gate_mid', 'gate_left', 'gate_right',
+                                choices=['gate_mid', 'gate_mid_new', 'gate_left', 'gate_right',
                                          'clutter', 'backroom', 'flightroom'],
                                 help='GS/point cloud map name. If not specified, uses the map from waypoints config.')
     collect_parser.add_argument('--waypoints', type=str, default='gate_mid',
@@ -377,6 +383,8 @@ def main():
                               help='Weight decay')
     train_parser.add_argument('--grad_clip', type=float, default=1.0,
                               help='Gradient clipping')
+    train_parser.add_argument('--grad_accum', type=int, default=1,
+                              help='Gradient accumulation steps (for full seq training with batch_size=1)')
     train_parser.add_argument('--val_ratio', type=float, default=0.1,
                               help='Validation ratio')
     train_parser.add_argument('--early_stop_patience', type=int, default=30,
@@ -419,7 +427,7 @@ def main():
     eval_parser.add_argument('--checkpoint', type=str, required=True,
                              help='Path to checkpoint')
     eval_parser.add_argument('--map', type=str, default=None,
-                             choices=['gate_mid', 'gate_left', 'gate_right',
+                             choices=['gate_mid', 'gate_mid_new', 'gate_left', 'gate_right',
                                       'clutter', 'backroom', 'flightroom'],
                              help='GS/point cloud map name. If not specified, uses the map from waypoints config.')
     eval_parser.add_argument('--waypoints', type=str, default='gate_mid',
