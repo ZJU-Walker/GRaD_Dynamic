@@ -99,6 +99,30 @@ def world_to_camera_transform(world_pos: torch.Tensor,
     return cam_pts if cam_pts.shape[0] > 1 else cam_pts[0]
 
 
+def transform_rotation_to_camera_frame(object_rotation: torch.Tensor,
+                                       camera_quat: torch.Tensor) -> torch.Tensor:
+    """
+    Transform an object's rotation from world frame to camera frame.
+
+    Args:
+        object_rotation: (4,) object rotation quaternion (x,y,z,w) in world frame
+        camera_quat: (4,) camera orientation quaternion (x,y,z,w) in world frame
+
+    Returns:
+        (3, 3) rotation matrix of object in camera frame
+    """
+    # Get camera rotation matrix (world to camera)
+    R_camera = quat_to_rotmat_xyzw(camera_quat)  # (3, 3)
+
+    # Get object rotation matrix in world frame
+    R_object_world = quat_to_rotmat_xyzw(object_rotation)  # (3, 3)
+
+    # Transform object rotation to camera frame: R_object_camera = R_camera.T @ R_object_world
+    R_object_camera = R_camera.T @ R_object_world
+
+    return R_object_camera
+
+
 def ray_sphere_intersection(ray_origin: torch.Tensor,
                            ray_dir: torch.Tensor,
                            sphere_center: torch.Tensor,
@@ -216,18 +240,13 @@ class DepthAugmentor:
         depth_map = depth_map.to(self.device)
         sphere_pos_world = sphere_pos_world.to(self.device)
 
-        # Support both camera_pos/quat and T_world_to_camera
-        if T_world_to_camera is not None:
-            T_world_to_camera = T_world_to_camera.to(self.device)
-            sphere_pos_cam = transform_point_with_matrix(sphere_pos_world, T_world_to_camera)
-        else:
-            camera_pos = camera_pos.to(self.device)
-            camera_quat = camera_quat.to(self.device)
-            sphere_pos_cam = world_to_camera_transform(
-                sphere_pos_world.unsqueeze(0) if sphere_pos_world.dim() == 1 else sphere_pos_world,
-                camera_pos,
-                camera_quat
-            )
+        camera_pos = camera_pos.to(self.device)
+        camera_quat = camera_quat.to(self.device)
+        sphere_pos_cam = world_to_camera_transform(
+            sphere_pos_world.unsqueeze(0) if sphere_pos_world.dim() == 1 else sphere_pos_world,
+            camera_pos,
+            camera_quat
+        )
 
         if sphere_pos_cam.dim() > 1:
             sphere_pos_cam = sphere_pos_cam.squeeze()
@@ -261,29 +280,37 @@ class DepthAugmentor:
                    max_depth: float = 15.0) -> torch.Tensor:
         """Inject a box into the depth map with proper occlusion handling"""
         H, W = depth_map.shape
-        device = depth_map.device
 
-        # Support both camera_pos/quat and T_world_to_camera
-        if T_world_to_camera is not None:
-            T_world_to_camera = T_world_to_camera.to(device)
-            box_pos_cam = transform_point_with_matrix(box_position, T_world_to_camera)
-        else:
-            box_pos_cam = world_to_camera_transform(
-                box_position.unsqueeze(0) if box_position.dim() == 1 else box_position,
-                camera_position,
-                camera_quaternion
-            )
+        # Move all tensors to the correct device (same as sphere)
+        depth_map = depth_map.to(self.device)
+        box_position = box_position.to(self.device)
+        box_size = box_size.to(self.device)
+        box_rotation = box_rotation.to(self.device)
+
+        device = self.device
+
+        camera_position = camera_position.to(device)
+        camera_quaternion = camera_quaternion.to(device)
+        box_pos_cam = world_to_camera_transform(
+            box_position.unsqueeze(0) if box_position.dim() == 1 else box_position,
+            camera_position,
+            camera_quaternion
+        )
         if box_pos_cam.dim() > 1:
             box_pos_cam = box_pos_cam.squeeze(0)
 
-        if box_rotation is not None and not torch.allclose(box_rotation, torch.tensor([0, 0, 0, 1], device=device, dtype=torch.float32)):
-            x, y, z, w = box_rotation
-            rot_matrix = torch.tensor([
-                [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
-                [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-                [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
-            ], device=device, dtype=torch.float32)
-            use_rotation = True
+        # Skip if box is behind camera
+        if box_pos_cam[2] < 0.1:
+            return depth_map
+
+        # Transform box rotation from world frame to camera frame
+        if box_rotation is not None:
+            if camera_quaternion is not None:
+                # Transform box rotation to camera frame
+                rot_matrix = transform_rotation_to_camera_frame(box_rotation, camera_quaternion)
+                use_rotation = True
+            else:
+                print("No Cam rotation")
         else:
             rot_matrix = torch.eye(3, device=device, dtype=torch.float32)
             use_rotation = False
@@ -319,10 +346,14 @@ class DepthAugmentor:
 
         t_min = torch.full((H, W), -float('inf'), device=device)
         t_max = torch.full((H, W), float('inf'), device=device)
+        no_intersection = torch.zeros((H, W), dtype=torch.bool, device=device)
+
+        # Ray origin in box-local space (camera is at origin, so ray origin = -cam_to_box_local = box_pos_cam)
+        ray_origin_local = -cam_to_box_local
 
         for axis in range(3):
             ray_dir_axis = ray_dirs_local[..., axis]
-            valid_rays = torch.abs(ray_dir_axis) > 1e-3
+            valid_rays = torch.abs(ray_dir_axis) > 1e-6
 
             ray_dir_safe = torch.where(valid_rays, ray_dir_axis, torch.ones_like(ray_dir_axis))
             t1 = (-half_size[axis] - cam_to_box_local[axis]) / ray_dir_safe
@@ -334,7 +365,12 @@ class DepthAugmentor:
             t_min = torch.where(valid_rays, torch.maximum(t_min, t_axis_min), t_min)
             t_max = torch.where(valid_rays, torch.minimum(t_max, t_axis_max), t_max)
 
-        valid_intersections = (t_min <= t_max) & (t_max > 0) & (t_min < max_depth)
+            # For parallel rays: check if ray origin is outside the slab bounds
+            # If so, there's no intersection
+            origin_outside_slab = (ray_origin_local[axis] < -half_size[axis]) | (ray_origin_local[axis] > half_size[axis])
+            no_intersection = no_intersection | (~valid_rays & origin_outside_slab)
+
+        valid_intersections = (t_min <= t_max) & (t_max > 0) & (t_min < max_depth) & (~no_intersection)
         intersection_depths = torch.where(t_min > 0, t_min, t_max)
         intersection_depths = torch.where(valid_intersections, intersection_depths, max_depth)
 
@@ -535,20 +571,13 @@ class DepthAugmentor:
 
         rgb_image = rgb_image.clone()
 
-        # Support both camera_pos/quat and T_world_to_camera
-        if T_world_to_camera is not None:
-            T_world_to_camera = T_world_to_camera.to(self.device)
-            sphere_pos_cam = transform_point_with_matrix(sphere_pos_world, T_world_to_camera)
-        else:
-            if camera_pos is not None:
-                camera_pos = camera_pos.to(self.device)
-            if camera_quat is not None:
-                camera_quat = camera_quat.to(self.device)
-            sphere_pos_cam = world_to_camera_transform(
-                sphere_pos_world.unsqueeze(0) if sphere_pos_world.dim() == 1 else sphere_pos_world,
-                camera_pos,
-                camera_quat
-            )
+        camera_pos = camera_pos.to(self.device)
+        camera_quat = camera_quat.to(self.device)
+        sphere_pos_cam = world_to_camera_transform(
+            sphere_pos_world.unsqueeze(0) if sphere_pos_world.dim() == 1 else sphere_pos_world,
+            camera_pos,
+            camera_quat
+        )
         if sphere_pos_cam.dim() > 1:
             sphere_pos_cam = sphere_pos_cam.squeeze()
 
@@ -607,29 +636,41 @@ class DepthAugmentor:
                        debug: bool = False) -> torch.Tensor:
         """Inject box into RGB image with proper shading and occlusion"""
         H, W, C = rgb_image.shape
-        device = rgb_image.device
 
-        # Support both camera_pos/quat and T_world_to_camera
-        if T_world_to_camera is not None:
-            T_world_to_camera = T_world_to_camera.to(device)
-            box_pos_cam = transform_point_with_matrix(box_position, T_world_to_camera)
-        else:
-            box_pos_cam = world_to_camera_transform(
-                box_position.unsqueeze(0) if box_position.dim() == 1 else box_position,
-                camera_position,
-                camera_quaternion
-            )
+        device = self.device
+        # Move all tensors to the correct device (same as sphere)
+        rgb_image = rgb_image.to(self.device)
+        depth_map = depth_map.to(self.device)
+        box_position = box_position.to(self.device)
+        box_size = box_size.to(self.device)
+        box_color = box_color.to(self.device)
+        box_rotation = box_rotation.to(self.device)
+        rgb_image = rgb_image.clone()
+
+        camera_position = camera_position.to(device)
+        camera_quaternion = camera_quaternion.to(device)
+
+        box_pos_cam = world_to_camera_transform(
+            box_position.unsqueeze(0) if box_position.dim() == 1 else box_position,
+            camera_position,
+            camera_quaternion
+        )
+
         if box_pos_cam.dim() > 1:
             box_pos_cam = box_pos_cam.squeeze(0)
 
-        if box_rotation is not None and not torch.allclose(box_rotation, torch.tensor([0, 0, 0, 1], device=device, dtype=torch.float32)):
-            x, y, z, w = box_rotation
-            rot_matrix = torch.tensor([
-                [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
-                [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-                [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
-            ], device=device, dtype=torch.float32)
-            use_rotation = True
+        # Skip if box is behind camera
+        if box_pos_cam[2] < 0.1:
+            return rgb_image
+
+        # Transform box rotation from world frame to camera frame
+        if box_rotation is not None:
+            if camera_quaternion is not None:
+                # Transform box rotation to camera frame
+                rot_matrix = transform_rotation_to_camera_frame(box_rotation, camera_quaternion)
+                use_rotation = True
+            else:
+                print("No Cam rotation")
         else:
             rot_matrix = torch.eye(3, device=device, dtype=torch.float32)
             use_rotation = False
@@ -665,12 +706,16 @@ class DepthAugmentor:
 
         t_min = torch.full((H, W), -float('inf'), device=device)
         t_max = torch.full((H, W), float('inf'), device=device)
+        no_intersection = torch.zeros((H, W), dtype=torch.bool, device=device)
 
         hit_face = torch.zeros((H, W), dtype=torch.int, device=device)
 
+        # Ray origin in box-local space (camera is at origin, so ray origin = -cam_to_box_local = box_pos_cam)
+        ray_origin_local = -cam_to_box_local
+
         for axis in range(3):
             ray_dir_axis = ray_dirs_local[..., axis]
-            valid_rays = torch.abs(ray_dir_axis) > 1e-3
+            valid_rays = torch.abs(ray_dir_axis) > 1e-6
 
             ray_dir_safe = torch.where(valid_rays, ray_dir_axis, torch.ones_like(ray_dir_axis))
             t1 = (-half_size[axis] - cam_to_box_local[axis]) / ray_dir_safe
@@ -686,7 +731,12 @@ class DepthAugmentor:
             t_min = torch.where(valid_rays, new_t_min, t_min)
             t_max = torch.where(valid_rays, torch.minimum(t_max, t_axis_max), t_max)
 
-        valid_intersections = (t_min <= t_max) & (t_max > 0)
+            # For parallel rays: check if ray origin is outside the slab bounds
+            # If so, there's no intersection
+            origin_outside_slab = (ray_origin_local[axis] < -half_size[axis]) | (ray_origin_local[axis] > half_size[axis])
+            no_intersection = no_intersection | (~valid_rays & origin_outside_slab)
+
+        valid_intersections = (t_min <= t_max) & (t_max > 0) & (~no_intersection)
         intersection_depths = torch.where(t_min > 0, t_min, t_max)
 
         visible_mask = valid_intersections & (intersection_depths <= depth_map + 0.01)
