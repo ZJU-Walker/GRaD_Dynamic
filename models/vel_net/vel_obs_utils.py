@@ -5,9 +5,9 @@ Helper functions for building velocity network observations:
 - Rot6D representation conversion
 - Observation vector construction
 
-IMU FUSION MODE (76 dims, no action):
-- Adds acceleration (IMU) to observation for physics-informed velocity estimation
-- Network uses corrupted IMU + vision to correct velocity prediction
+IMU VELOCITY MODE (76 dims, no action):
+- Uses IMU velocity directly instead of acceleration
+- Network uses IMU velocity + vision for velocity estimation
 - Action removed from observations
 """
 
@@ -130,26 +130,26 @@ def build_vel_observation(rot6d: torch.Tensor,
                           prev_vel: torch.Tensor,
                           rgb_feat: Optional[torch.Tensor] = None,
                           depth_feat: Optional[torch.Tensor] = None,
-                          accel: Optional[torch.Tensor] = None,
+                          imu_vel: Optional[torch.Tensor] = None,
                           device: Optional[str] = None,
                           rgb_feat_dim: int = 32,
                           depth_feat_dim: int = 32) -> torch.Tensor:
     """
-    Build 76-dim velocity observation vector (IMU fusion mode, no action).
+    Build 76-dim velocity observation vector (IMU velocity mode, no action).
 
     Observation structure:
         [0:6]   - Rot6D rotation (6 dims)
         [6:9]   - Previous velocity (3 dims) - auto-regressive term
         [9:41]  - RGB features (32 dims)
         [41:73] - Depth features (32 dims)
-        [73:76] - Acceleration/IMU (3 dims) - for physics-informed fusion
+        [73:76] - IMU velocity (3 dims) - direct velocity from IMU topic
 
     Args:
         rot6d: Rotation in Rot6D format (B, 6)
         prev_vel: Previous velocity estimate (B, 3)
         rgb_feat: RGB visual features (B, 32), zeros if None
         depth_feat: Depth visual features (B, 32), zeros if None
-        accel: Acceleration/IMU reading (B, 3), zeros if None
+        imu_vel: IMU velocity reading (B, 3), zeros if None
         device: Device for output tensor
         rgb_feat_dim: Dimension of RGB features (default: 32)
         depth_feat_dim: Dimension of depth features (default: 32)
@@ -167,15 +167,15 @@ def build_vel_observation(rot6d: torch.Tensor,
         rgb_feat = torch.zeros(B, rgb_feat_dim, device=device)
     if depth_feat is None:
         depth_feat = torch.zeros(B, depth_feat_dim, device=device)
-    if accel is None:
-        accel = torch.zeros(B, 3, device=device)
+    if imu_vel is None:
+        imu_vel = torch.zeros(B, 3, device=device)
 
     # Validate shapes
     assert rot6d.shape == (B, 6), f"rot6d shape mismatch: {rot6d.shape}"
     assert prev_vel.shape == (B, 3), f"prev_vel shape mismatch: {prev_vel.shape}"
     assert rgb_feat.shape == (B, rgb_feat_dim), f"rgb_feat shape mismatch: {rgb_feat.shape}"
     assert depth_feat.shape == (B, depth_feat_dim), f"depth_feat shape mismatch: {depth_feat.shape}"
-    assert accel.shape == (B, 3), f"accel shape mismatch: {accel.shape}"
+    assert imu_vel.shape == (B, 3), f"imu_vel shape mismatch: {imu_vel.shape}"
 
     # Concatenate all components
     vel_obs = torch.cat([
@@ -183,7 +183,7 @@ def build_vel_observation(rot6d: torch.Tensor,
         prev_vel,    # 3 dims
         rgb_feat,    # 32 dims
         depth_feat,  # 32 dims
-        accel,       # 3 dims (IMU)
+        imu_vel,     # 3 dims (IMU velocity)
     ], dim=-1)
 
     total_dim = 6 + 3 + rgb_feat_dim + depth_feat_dim + 3
@@ -196,7 +196,7 @@ def build_vel_observation_from_quat(quat: torch.Tensor,
                                     prev_vel: torch.Tensor,
                                     rgb_feat: Optional[torch.Tensor] = None,
                                     depth_feat: Optional[torch.Tensor] = None,
-                                    accel: Optional[torch.Tensor] = None,
+                                    imu_vel: Optional[torch.Tensor] = None,
                                     rgb_feat_dim: int = 32,
                                     depth_feat_dim: int = 32) -> torch.Tensor:
     """
@@ -207,7 +207,7 @@ def build_vel_observation_from_quat(quat: torch.Tensor,
         prev_vel: Previous velocity (B, 3)
         rgb_feat: RGB features (B, 32), optional
         depth_feat: Depth features (B, 32), optional
-        accel: Acceleration/IMU reading (B, 3), optional
+        imu_vel: IMU velocity reading (B, 3), optional
         rgb_feat_dim: Dimension of RGB features (default: 32)
         depth_feat_dim: Dimension of depth features (default: 32)
 
@@ -216,13 +216,13 @@ def build_vel_observation_from_quat(quat: torch.Tensor,
     """
     rot6d = quaternion_to_rot6d(quat)
     return build_vel_observation(rot6d, prev_vel,
-                                 rgb_feat, depth_feat, accel, device=quat.device,
+                                 rgb_feat, depth_feat, imu_vel, device=quat.device,
                                  rgb_feat_dim=rgb_feat_dim, depth_feat_dim=depth_feat_dim)
 
 
 # Observation component indices for easy access
 class VelObsIndices:
-    """Indices for velocity observation components (76 dims total with IMU, no action)."""
+    """Indices for velocity observation components (76 dims total with IMU velocity, no action)."""
     ROT6D_START = 0
     ROT6D_END = 6           # 6 dims
 
@@ -235,15 +235,15 @@ class VelObsIndices:
     DEPTH_FEAT_START = 41
     DEPTH_FEAT_END = 73     # 32 dims
 
-    ACCEL_START = 73
-    ACCEL_END = 76          # 3 dims (IMU acceleration)
+    IMU_VEL_START = 73
+    IMU_VEL_END = 76        # 3 dims (IMU velocity)
 
     TOTAL_DIM = 76          # 6 + 3 + 32 + 32 + 3 = 76
 
     # Feature dimensions
     RGB_FEAT_DIM = 32
     DEPTH_FEAT_DIM = 32
-    ACCEL_DIM = 3
+    IMU_VEL_DIM = 3
 
 
 def extract_vel_obs_components(vel_obs: torch.Tensor) -> dict:
@@ -251,10 +251,10 @@ def extract_vel_obs_components(vel_obs: torch.Tensor) -> dict:
     Extract individual components from velocity observation.
 
     Args:
-        vel_obs: Velocity observation (B, 76) with IMU, no action
+        vel_obs: Velocity observation (B, 76) with IMU velocity, no action
 
     Returns:
-        Dictionary with keys: rot6d, prev_vel, rgb_feat, depth_feat, accel
+        Dictionary with keys: rot6d, prev_vel, rgb_feat, depth_feat, imu_vel
     """
     idx = VelObsIndices
     result = {
@@ -263,9 +263,9 @@ def extract_vel_obs_components(vel_obs: torch.Tensor) -> dict:
         'rgb_feat': vel_obs[:, idx.RGB_FEAT_START:idx.RGB_FEAT_END],  # (B, 32)
         'depth_feat': vel_obs[:, idx.DEPTH_FEAT_START:idx.DEPTH_FEAT_END],  # (B, 32)
     }
-    # Include accel if observation has 76 dims
-    if vel_obs.shape[1] >= idx.ACCEL_END:
-        result['accel'] = vel_obs[:, idx.ACCEL_START:idx.ACCEL_END]  # (B, 3)
+    # Include imu_vel if observation has 76 dims
+    if vel_obs.shape[1] >= idx.IMU_VEL_END:
+        result['imu_vel'] = vel_obs[:, idx.IMU_VEL_START:idx.IMU_VEL_END]  # (B, 3)
     return result
 
 
@@ -285,17 +285,17 @@ if __name__ == '__main__':
     rot6ds = quaternion_to_rot6d(quats)
     print(f"Batch conversion: {quats.shape} -> {rot6ds.shape}")
 
-    # Test build_vel_observation (76 dims with IMU, no action)
-    print("\nTesting build_vel_observation (76 dims with IMU, no action)...")
+    # Test build_vel_observation (76 dims with IMU velocity, no action)
+    print("\nTesting build_vel_observation (76 dims with IMU velocity, no action)...")
     B = 4
     rot6d = torch.randn(B, 6)
     prev_vel = torch.randn(B, 3)
     rgb_feat = torch.randn(B, 32)
     depth_feat = torch.randn(B, 32)
-    accel = torch.randn(B, 3)  # IMU acceleration
+    imu_vel = torch.randn(B, 3)  # IMU velocity
 
     vel_obs = build_vel_observation(rot6d, prev_vel,
-                                    rgb_feat, depth_feat, accel)
+                                    rgb_feat, depth_feat, imu_vel)
     print(f"Velocity observation shape: {vel_obs.shape}")  # Should be (4, 76)
 
     # Test extraction
@@ -303,11 +303,11 @@ if __name__ == '__main__':
     print(f"Extracted components: {list(components.keys())}")
     print(f"Rot6D matches: {torch.allclose(components['rot6d'], rot6d)}")
     print(f"Prev_vel matches: {torch.allclose(components['prev_vel'], prev_vel)}")
-    print(f"Accel matches: {torch.allclose(components['accel'], accel)}")
+    print(f"IMU vel matches: {torch.allclose(components['imu_vel'], imu_vel)}")
     print(f"RGB feat shape: {components['rgb_feat'].shape}")  # Should be (4, 32)
     print(f"Depth feat shape: {components['depth_feat'].shape}")  # Should be (4, 32)
-    print(f"Accel shape: {components['accel'].shape}")  # Should be (4, 3)
+    print(f"IMU vel shape: {components['imu_vel'].shape}")  # Should be (4, 3)
 
-    # Test with missing visual features and accel (default zeros)
+    # Test with missing visual features and imu_vel (default zeros)
     vel_obs_minimal = build_vel_observation(rot6d, prev_vel)
-    print(f"Without visual features/accel: {vel_obs_minimal.shape}")  # Should be (4, 76)
+    print(f"Without visual features/imu_vel: {vel_obs_minimal.shape}")  # Should be (4, 76)

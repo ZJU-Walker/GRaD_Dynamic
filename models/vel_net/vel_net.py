@@ -9,12 +9,11 @@ The network directly predicts velocity change from visual and IMU features:
     v_t = v_{t-1} + Network(obs)
 
 Where:
-- obs: Includes normalized IMU acceleration as an input feature (indicator)
+- obs: Includes normalized IMU velocity as an input feature
 - Network(obs): Directly predicts delta_v (velocity change)
 
-IMU acceleration is included in the observation as a feature but is NOT used
-for physics integration. IMU noise augmentation during training helps the
-network learn to be robust to noisy IMU readings.
+IMU velocity is included in the observation as a feature to help the network
+learn velocity estimation with noisy IMU readings.
 
 Architecture:
     Input (76 dims) → LayerNorm → Projector MLP → GRU → Head MLP → Delta-V (3D)
@@ -62,16 +61,16 @@ class VELO_NET(nn.Module):
         device: Device to place the model on (default: 'cpu')
     """
 
-    # Observation structure indices (76 dims total with IMU, no action)
+    # Observation structure indices (76 dims total with IMU velocity, no action)
     # [0:6]   - Rot6D (rotation)
     # [6:9]   - Previous velocity (auto-regressive term)
     # [9:41]  - RGB features (32 dims)
     # [41:73] - Depth features (32 dims)
-    # [73:76] - Acceleration/IMU (3 dims)
+    # [73:76] - IMU velocity (3 dims)
     PREV_VEL_START_IDX = 6
     PREV_VEL_END_IDX = 9
-    ACCEL_START_IDX = 73
-    ACCEL_END_IDX = 76
+    IMU_VEL_START_IDX = 73
+    IMU_VEL_END_IDX = 76
 
     def __init__(self,
                  num_obs: int = 76,
