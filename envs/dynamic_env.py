@@ -151,8 +151,8 @@ class DynamicDroneEnv(ExpertDroneEnv):
         self.current_phase = 1  # 1 = static only, 2 = dynamic with danger-aware rewards
         self.dynamic_spawn_prob = 0.0  # Controlled by GradNavDynamic curriculum
 
-        # Temporal danger tracking (depth-based)
-        self.prev_depth_dist = torch.full((self.num_envs,), float('inf'), device=self.device)
+        # Temporal danger tracking (dynamic object distance-based, NOT general depth)
+        self.prev_dynamic_dist = torch.full((self.num_envs,), float('inf'), device=self.device)
         self.danger_flag = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # === Metrics storage for logging ===
@@ -174,6 +174,8 @@ class DynamicDroneEnv(ExpertDroneEnv):
             'r_retreat': torch.zeros(self.num_envs, device=self.device),
             'r_no_forward': torch.zeros(self.num_envs, device=self.device),
             'r_back_pen': torch.zeros(self.num_envs, device=self.device),
+            'r_wait': torch.zeros(self.num_envs, device=self.device),
+            'r_forward_progress': torch.zeros(self.num_envs, device=self.device),
             'phase2_reward': torch.zeros(self.num_envs, device=self.device),
             # Spawn info
             'num_active_objects': torch.zeros(self.num_envs, device=self.device),
@@ -223,24 +225,34 @@ class DynamicDroneEnv(ExpertDroneEnv):
             box_size = obj_cfg.get('box_size', None)
             box_rotation = obj_cfg.get('box_rotation', None)
 
-            # Trajectory file
+            # Trajectory file(s) - support single file or list for random selection
             trajectory_file = obj_cfg.get('trajectory', None)
+            trajectory_files = obj_cfg.get('trajectories', None)  # List of files for random selection
 
             for env_id in env_ids_to_spawn:
                 env_id_int = env_id.item() if isinstance(env_id, torch.Tensor) else env_id
 
-                if trajectory_file:
+                # Select trajectory file (random if list provided)
+                selected_trajectory = None
+                if trajectory_files is not None and len(trajectory_files) > 0:
+                    # Randomly select from list
+                    import random
+                    selected_trajectory = random.choice(trajectory_files)
+                elif trajectory_file is not None:
+                    selected_trajectory = trajectory_file
+
+                if selected_trajectory:
                     try:
                         # Create trajectory pattern
                         pattern = TrajectoryPattern(
-                            trajectory_file=trajectory_file,
+                            trajectory_file=selected_trajectory,
                             loop=obj_cfg.get('loop', True),
                             device=self.device,
                         )
                         # Get initial position from trajectory
                         init_pos = pattern.get_position(0.0)
                     except Exception as e:
-                        print(f"[DynamicDroneEnv] Failed to load trajectory {trajectory_file}: {e}")
+                        print(f"[DynamicDroneEnv] Failed to load trajectory {selected_trajectory}: {e}")
                         import traceback
                         traceback.print_exc()
                         continue
@@ -296,26 +308,34 @@ class DynamicDroneEnv(ExpertDroneEnv):
     def _compute_danger_info(self):
         """Compute temporal danger info for Phase 2 reward.
 
-        Uses depth-based distance (self.depth_list) to detect approaching obstacles.
+        Uses DYNAMIC OBJECT distance (self.min_dist_to_dynamic) to detect approaching dynamic obstacles.
+        This is critical: we must NOT use general depth (self.depth_list) because that would trigger
+        danger-aware rewards when approaching STATIC obstacles (gates, walls), causing the drone
+        to deviate from the trajectory even without dynamic obstacles nearby.
+
         Wrapped in no_grad to avoid gradient flow (consistent with _check_dynamic_collisions).
 
         Returns:
-            danger_t: (num_envs,) bool tensor - True if approaching + risky
-            delta_d: (num_envs,) float tensor - distance change (d_t - d_{t-1})
+            danger_t: (num_envs,) bool tensor - True if approaching dynamic object + risky
+            delta_d: (num_envs,) float tensor - distance change to dynamic object (d_t - d_{t-1})
         """
         with torch.no_grad():
-            # Get current depth-based distance (min depth from upper half of frame)
-            # self.depth_list is (num_envs, 1) from _update_visual_features()
-            d_t = self.depth_list.squeeze(1).detach()  # (num_envs,)
+            # Get current distance to DYNAMIC objects (not general depth!)
+            # self.min_dist_to_dynamic is updated in _check_dynamic_collisions()
+            # When no dynamic objects are active, this is inf, so danger_t will be False
+            d_t = self.min_dist_to_dynamic.detach()  # (num_envs,)
 
             # Check for valid previous distance (skip first step after reset where prev=inf)
-            valid_prev = torch.isfinite(self.prev_depth_dist)
+            valid_prev = torch.isfinite(self.prev_dynamic_dist)
 
-            # Compute distance change (only valid where prev_depth_dist is finite)
+            # Also check current distance is finite (dynamic object exists)
+            valid_curr = torch.isfinite(d_t)
+
+            # Compute distance change (only valid where both prev and curr are finite)
             delta_d = torch.where(
-                valid_prev,
-                d_t - self.prev_depth_dist,
-                torch.zeros_like(d_t)  # No change on first step
+                valid_prev & valid_curr,
+                d_t - self.prev_dynamic_dist,
+                torch.zeros_like(d_t)  # No change if no valid comparison
             )
 
             # Compute distance rate (d_dot = delta_d / dt)
@@ -329,19 +349,24 @@ class DynamicDroneEnv(ExpertDroneEnv):
                 torch.full_like(d_t, float('inf'))
             )
 
-            # Danger gating condition (must have valid previous distance)
-            approaching = (d_dot < -eps) & valid_prev
+            # Danger gating condition:
+            # - Must have valid previous distance
+            # - Must have valid current distance (dynamic object exists)
+            # - Must be approaching (d_dot < 0)
+            # - Must be close enough (d_t < threshold)
+            # - Must have low TTC
+            approaching = (d_dot < -eps) & valid_prev & valid_curr
             close_enough = d_t < self.cfg.danger_dist_threshold
             low_ttc = ttc < self.cfg.danger_ttc_threshold
 
             danger_t = approaching & close_enough & low_ttc
 
             # Update previous distance for next step (no clone needed, already detached)
-            self.prev_depth_dist = d_t
+            self.prev_dynamic_dist = d_t
             self.danger_flag = danger_t
 
             # Store metrics for logging (all detached to avoid graph retention)
-            self._metrics['depth_dist'] = d_t.detach()
+            self._metrics['depth_dist'] = d_t.detach()  # Now this is dynamic object dist
             self._metrics['delta_d'] = delta_d.detach()
             self._metrics['d_dot'] = d_dot.detach()
             self._metrics['ttc'] = ttc.detach()
@@ -355,6 +380,9 @@ class DynamicDroneEnv(ExpertDroneEnv):
 
         Detached from gradient graph (consistent with _check_dynamic_collisions).
 
+        When use_pred_vel_in_obs is enabled, uses blended velocity (same as observation)
+        to ensure consistency between what policy sees and what reward uses.
+
         Returns:
             forward_vel: (num_envs,) float tensor - forward velocity (positive = forward, negative = backward)
         """
@@ -362,7 +390,21 @@ class DynamicDroneEnv(ExpertDroneEnv):
 
         with torch.no_grad():
             # Get linear velocity (detached to avoid gradient flow)
-            lin_vel = self.state_joint_qd[:, 0:3].detach()  # (num_envs, 3) world frame
+            # state_joint_qd structure: [ang_vel (0:3), lin_vel (3:6)]
+            gt_lin_vel = self.state_joint_qd[:, 3:6].detach()  # (num_envs, 3) world frame
+
+            # Use blended velocity when use_pred_vel_in_obs is enabled (consistency with obs)
+            if self.vel_net_enabled and self.use_pred_vel_in_obs:
+                # Get blended velocity (same as used in observation)
+                # Note: vel_net_pred_vel is in vel_frame (body or world)
+                if self.vel_frame == 'world':
+                    lin_vel = self.get_blended_velocity(gt_lin_vel)
+                else:
+                    # If vel_frame is body, we need world frame for heading projection
+                    # Use GT world velocity blended with pred (transformed if needed)
+                    lin_vel = self.get_blended_velocity(gt_lin_vel)
+            else:
+                lin_vel = gt_lin_vel
 
             # Get heading direction from quaternion (detached)
             torso_quat = self.state_joint_q[:, 3:7].detach()  # (x, y, z, w)
@@ -385,7 +427,7 @@ class DynamicDroneEnv(ExpertDroneEnv):
             self._spawn_dynamic_objects(spawn_env_ids)
 
             # Reset temporal danger tracking for reset environments
-            self.prev_depth_dist[spawn_env_ids] = float('inf')
+            self.prev_dynamic_dist[spawn_env_ids] = float('inf')
             self.danger_flag[spawn_env_ids] = False
 
         # Call parent reset (this will call calculateObservations -> process_GS_data)
@@ -399,6 +441,20 @@ class DynamicDroneEnv(ExpertDroneEnv):
             # Replace RGB frame
             augmented_rgb_frame = torch.permute(self.augmented_rgb[0], (2, 0, 1))
             augmented_rgb_transformed = img_transform(augmented_rgb_frame)
+
+            # Overlay velocity text on augmented image
+            lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6]
+            velo_data = lin_vel.clone().detach().cpu().numpy()
+            vx, vy, vz = velo_data[0, 0], velo_data[0, 1], velo_data[0, 2]
+            vel_mag = np.sqrt(vx**2 + vy**2 + vz**2)
+            text_lines = [
+                f"Vel: [{vx:.2f}, {vy:.2f}, {vz:.2f}] m/s",
+                f"|V|: {vel_mag:.2f} m/s",
+            ]
+            augmented_rgb_transformed = self.viz_recorder._overlay_text_on_image(
+                augmented_rgb_transformed, text_lines
+            )
+
             self.viz_recorder.img_record[-1] = augmented_rgb_transformed
 
             # Replace depth frame
@@ -424,6 +480,20 @@ class DynamicDroneEnv(ExpertDroneEnv):
             # Replace RGB frame
             augmented_rgb_frame = torch.permute(self.augmented_rgb[0], (2, 0, 1))
             augmented_rgb_transformed = img_transform(augmented_rgb_frame)
+
+            # Overlay velocity text on augmented image
+            lin_vel = self.state_joint_qd.view(self.num_envs, -1)[:, 3:6]
+            velo_data = lin_vel.clone().detach().cpu().numpy()
+            vx, vy, vz = velo_data[0, 0], velo_data[0, 1], velo_data[0, 2]
+            vel_mag = np.sqrt(vx**2 + vy**2 + vz**2)
+            text_lines = [
+                f"Vel: [{vx:.2f}, {vy:.2f}, {vz:.2f}] m/s",
+                f"|V|: {vel_mag:.2f} m/s",
+            ]
+            augmented_rgb_transformed = self.viz_recorder._overlay_text_on_image(
+                augmented_rgb_transformed, text_lines
+            )
+
             self.viz_recorder.img_record[-1] = augmented_rgb_transformed
 
             # Replace depth frame
@@ -445,23 +515,25 @@ class DynamicDroneEnv(ExpertDroneEnv):
         # Call parent reward calculation (static obstacles, waypoints, etc.)
         super().calculateReward()
 
-        # Add dynamic obstacle reward (similar to static obst_reward pattern)
+        # Add dynamic obstacle penalty (penalize being close to dynamic obstacles)
         if self.use_dynamic_objects:
-            # Reward proportional to distance when within threshold
-            # Closer = more negative reward (penalty)
-            dynamic_obst_reward = torch.where(
+            # Penalty that increases as drone gets closer to dynamic obstacle
+            # At threshold distance: penalty = 0
+            # At distance 0: penalty = -threshold * strength
+            # This encourages staying away from dynamic obstacles
+            dynamic_obst_penalty = torch.where(
                 self.min_dist_to_dynamic < self.cfg.dynamic_obst_threshold,
-                self.min_dist_to_dynamic * self.cfg.dynamic_obst_strength,
+                -self.cfg.dynamic_obst_strength * (self.cfg.dynamic_obst_threshold - self.min_dist_to_dynamic),
                 torch.zeros_like(self.min_dist_to_dynamic)
             )
 
-            # Add to reward buffer (reward is negative for obstacles, so this encourages staying far)
-            self.rew_buf = self.rew_buf + dynamic_obst_reward
+            # Add to reward buffer
+            self.rew_buf = self.rew_buf + dynamic_obst_penalty
 
             # Store metrics for logging (all detached to avoid graph retention)
             self._metrics['min_dist_to_dynamic'] = self.min_dist_to_dynamic.detach()
             self._metrics['collision_flag'] = self.collision_buf.detach()
-            self._metrics['dynamic_obst_reward'] = dynamic_obst_reward.detach()
+            self._metrics['dynamic_obst_reward'] = dynamic_obst_penalty.detach()  # Now a penalty
             self._metrics['num_active_objects'] = self.dynamic_manager.active.sum(dim=1).float().detach()
 
             # Phase 2: Add danger-aware retreat rewards
@@ -484,9 +556,36 @@ class DynamicDroneEnv(ExpertDroneEnv):
                 # (3) Backward penalty: small regularization to prevent always reversing
                 r_back_pen = -self.cfg.k_backward * torch.clamp(-forward_vel_clamped, min=0)
 
-                # Combine Phase 2 rewards with safety clamp
-                phase2_reward = r_retreat + r_no_forward + r_back_pen
-                phase2_reward = torch.clamp(phase2_reward, min=-20.0, max=20.0)
+                # (4) Wait reward: explicitly reward low velocity (hovering) when danger detected
+                # This encourages "stop and wait" behavior instead of rushing
+                # Use blended velocity when use_pred_vel_in_obs is enabled (consistency with obs)
+                if self.vel_net_enabled and self.use_pred_vel_in_obs:
+                    gt_vel = self.state_joint_qd[:, 3:6].detach()
+                    blended_vel = self.get_blended_velocity(gt_vel)
+                    vel_magnitude = torch.norm(blended_vel, dim=1)
+                else:
+                    vel_magnitude = torch.norm(self.state_joint_qd[:, 3:6], dim=1)  # GT velocity magnitude
+                is_waiting = vel_magnitude < self.cfg.wait_vel_threshold  # True if velocity below threshold
+                r_wait = self.cfg.k_wait * danger_t.float() * is_waiting.float()
+
+                # Combine Phase 2 rewards
+                phase2_reward = r_retreat + r_no_forward + r_back_pen + r_wait
+
+                # (4) Forward progress reward: encourage moving forward when SAFE
+                # Only applies when no danger detected (obstacle far away)
+                safe_t = ~danger_t  # Safe when NOT in danger
+                # Also check if obstacle is beyond safe distance threshold
+                safe_dist = self.min_dist_to_dynamic > self.cfg.safe_dist_threshold
+                is_safe = safe_t | safe_dist  # Safe if no danger OR obstacle far away
+
+                # Reward forward velocity when safe (penalize being slow when safe)
+                # forward_vel > min_forward_vel gets positive reward
+                # forward_vel < min_forward_vel gets negative reward (idle penalty)
+                forward_progress = forward_vel_clamped - self.cfg.min_forward_vel
+                r_forward_progress = self.cfg.forward_progress_weight * is_safe.float() * forward_progress
+
+                # Add forward progress reward to phase2
+                phase2_reward = phase2_reward + r_forward_progress
 
                 # Replace any NaN/inf with 0 (safety check)
                 phase2_reward = torch.nan_to_num(phase2_reward, nan=0.0, posinf=0.0, neginf=0.0)
@@ -499,6 +598,8 @@ class DynamicDroneEnv(ExpertDroneEnv):
                 self._metrics['r_retreat'] = r_retreat.detach()
                 self._metrics['r_no_forward'] = r_no_forward.detach()
                 self._metrics['r_back_pen'] = r_back_pen.detach()
+                self._metrics['r_wait'] = r_wait.detach()
+                self._metrics['r_forward_progress'] = r_forward_progress.detach()
                 self._metrics['phase2_reward'] = phase2_reward.detach()
 
     def process_GS_data(self, depth_list, rgb_img):
@@ -653,17 +754,18 @@ class DynamicDroneEnv(ExpertDroneEnv):
         depth_list_up = depth_list[:, 0:int(H/2), :, :]
         self.depth_list = torch.abs(torch.amin(depth_list_up, dim=(1, 2, 3))).unsqueeze(1).to(device=self.device)
 
+        # For policy (SqueezeNet): use 224x224 resized images
         visual_tensor = rgb_img.permute(0, 3, 1, 2)
         resize = nn.AdaptiveAvgPool2d((224, 224))
-        visual_tensor = resize(visual_tensor).to(self.device)
-        self.visual_info = self.visual_net(visual_tensor).detach()
+        visual_tensor_resized = resize(visual_tensor).to(self.device)
+        self.visual_info = self.visual_net(visual_tensor_resized).detach()
 
-        # Update DualEncoder features for vel_net (if enabled)
+        # For vel_net (DualEncoder): use RAW images (no resize) to match training
         if self.vel_net_enabled and self.dual_encoder is not None:
             with torch.no_grad():
-                depth_tensor = depth_list.permute(0, 3, 1, 2)
-                depth_tensor = resize(depth_tensor).to(self.device)
-                self.rgb_feat_vel, self.depth_feat_vel = self.dual_encoder(visual_tensor, depth_tensor)
+                rgb_raw = rgb_img.permute(0, 3, 1, 2).to(self.device)
+                depth_raw = depth_list.permute(0, 3, 1, 2).to(self.device)
+                self.rgb_feat_vel, self.depth_feat_vel = self.dual_encoder(rgb_raw, depth_raw)
 
     def get_dynamic_object_info(self):
         """Get information about dynamic objects for debugging/visualization.
@@ -727,12 +829,25 @@ class DynamicDroneEnv(ExpertDroneEnv):
         # Velocity
         compute_stats(self._metrics['forward_vel'], 'dyn/forward_vel')
 
-        # Reward components
+        # Dynamic reward components
         compute_stats(self._metrics['dynamic_obst_reward'], 'dyn/r_obst')
         compute_stats(self._metrics['r_retreat'], 'dyn/r_retreat')
         compute_stats(self._metrics['r_no_forward'], 'dyn/r_no_forward')
+        compute_stats(self._metrics['r_wait'], 'dyn/r_wait')
+        compute_stats(self._metrics['r_forward_progress'], 'dyn/r_forward_progress')
         compute_stats(self._metrics['r_back_pen'], 'dyn/r_back_pen')
         compute_stats(self._metrics['phase2_reward'], 'dyn/r_phase2')
+
+        # Base reward components (from reward.py)
+        if hasattr(self, 'reward_components') and self.reward_components is not None:
+            for name, value in self.reward_components.items():
+                if isinstance(value, torch.Tensor):
+                    compute_stats(value.detach(), f'rew/{name}')
+                else:
+                    metrics[f'rew/{name}'] = value
+
+        # Total reward
+        compute_stats(self.rew_buf.detach(), 'rew/total')
 
         # Spawn info
         metrics['dyn/num_active_objects'] = self._metrics['num_active_objects'].mean().item()
