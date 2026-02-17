@@ -17,7 +17,7 @@ for physics integration. IMU noise augmentation during training helps the
 network learn to be robust to noisy IMU readings.
 
 Architecture:
-    Input (84 dims) → LayerNorm → Projector MLP → GRU → Head MLP → Delta-V (3D)
+    Input (76 dims) → LayerNorm → Projector MLP → GRU → Head MLP → Delta-V (3D)
     Final: vel_pred = prev_vel + delta_v
 """
 
@@ -52,7 +52,7 @@ class VELO_NET(nn.Module):
     Implements direct prediction: vel = prev_vel + delta_v
 
     Args:
-        num_obs: Observation dimension per timestep (default: 84 with IMU)
+        num_obs: Observation dimension per timestep (default: 76 with IMU, no action)
         stack_size: Number of stacked timesteps in history (default: 1 for testing)
         num_latent: Latent dimension for head MLP (default: 64)
         activation: Activation function name (default: 'elu')
@@ -62,21 +62,19 @@ class VELO_NET(nn.Module):
         device: Device to place the model on (default: 'cpu')
     """
 
-    # Observation structure indices (84 dims total with IMU)
+    # Observation structure indices (76 dims total with IMU, no action)
     # [0:6]   - Rot6D (rotation)
-    # [6:10]  - Current action
-    # [10:14] - Previous action
-    # [14:17] - Previous velocity (auto-regressive term)
-    # [17:49] - RGB features (32 dims)
-    # [49:81] - Depth features (32 dims)
-    # [81:84] - Acceleration/IMU (3 dims)
-    PREV_VEL_START_IDX = 14
-    PREV_VEL_END_IDX = 17
-    ACCEL_START_IDX = 81
-    ACCEL_END_IDX = 84
+    # [6:9]   - Previous velocity (auto-regressive term)
+    # [9:41]  - RGB features (32 dims)
+    # [41:73] - Depth features (32 dims)
+    # [73:76] - Acceleration/IMU (3 dims)
+    PREV_VEL_START_IDX = 6
+    PREV_VEL_END_IDX = 9
+    ACCEL_START_IDX = 73
+    ACCEL_END_IDX = 76
 
     def __init__(self,
-                 num_obs: int = 84,
+                 num_obs: int = 76,
                  stack_size: int = 1,
                  num_latent: int = 64,
                  activation: str = 'elu',
@@ -317,10 +315,11 @@ class VELO_NET(nn.Module):
         v = estimation[0]
         vel_mu, vel_logvar = latent_params
 
-        # Supervised loss (Smooth L1 / Huber loss)
+        # Supervised loss (MSE for better magnitude sensitivity)
+        # MSE penalizes large errors quadratically, improving magnitude accuracy
         v = torch.clamp(v, min=-1e2, max=1e2)
         vel_gt = torch.clamp(vel_gt, min=-1e2, max=1e2)
-        vel_loss = F.smooth_l1_loss(v, vel_gt, reduction='none').mean(-1)
+        vel_loss = F.mse_loss(v, vel_gt, reduction='none').mean(-1)
         loss = torch.clamp(vel_loss, max=1e4)
 
         # PINN loss (physics-informed regularization)
