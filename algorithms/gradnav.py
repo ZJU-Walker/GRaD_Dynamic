@@ -180,6 +180,7 @@ class GradNav:
 
         # vel_net fine-tuning setup
         self.vel_net_cfg = vel_net_cfg if vel_net_cfg is not None else {}
+        self.vel_net_enabled = self.vel_net_cfg.get('enabled', False)
         self.vel_net_finetune = self.vel_net_cfg.get('finetune', False)
         self.vel_net_finetune_start_iter = self.vel_net_cfg.get('finetune_start_iter', 200)
         self.vel_net_lr = float(self.vel_net_cfg.get('learning_rate', 1e-4))
@@ -660,6 +661,10 @@ class GradNav:
             if self.vel_net_finetune and not self.vel_net_finetuning_started:
                 if self.iter_count >= self.vel_net_finetune_start_iter:
                     self.start_vel_net_finetuning()
+
+            # Update GT→pred velocity curriculum (if enabled)
+            if self.vel_net_enabled:
+                self.env.update_gt_vel_curriculum(self.iter_count)
 
             # Multi gate training process
             if self.multi_gate:

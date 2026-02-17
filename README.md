@@ -182,6 +182,26 @@ python training/vel_net/precompute_features.py \
       --seq_length 32 --stride 16 \
       --tf_start_epoch 10 --tf_end_epoch 60 \
       --wandb --checkpoint_dir /scr/irislab/ke/checkpoints/vel_net_0124_delta
+# Train with body velocity
+python training/vel_net_body/train_vel_net_body.py train \
+      --data_dir /scr/irislab/ke/data/vel_net/gate_mid_new_veldata \
+      --checkpoint_dir checkpoints/vel_net_body \
+      --epochs 500 \
+      --batch_size 16 \
+      --seq_length 32 --stride 16 \
+      --tf_start_epoch 10 --tf_end_epoch 60 \
+      --device cuda:0
+
+# Train with full seq body
+python training/vel_net_body/train_vel_net_body.py train \
+      --data_dir /scr/irislab/ke/data/vel_net/gate_mid_new_veldata \
+      --checkpoint_dir checkpoints/vel_net_body_full_seq \
+      --epochs 500 \
+      --batch_size 1 \
+      --grad_accum 8 \
+      --seq_length 0 \
+      --tf_start_epoch 20 --tf_end_epoch 150 \
+      --device cuda:0
 ```
 
 **Options:**
@@ -486,7 +506,7 @@ python examples/train_gradnav.py     --cfg examples/cfg/gradnav/drone_test.yaml 
 
 ## To eval a gradnav policy:
 ```
- python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_test.yaml --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/examples/logs/gradnav_test/gate_mid/gradnav_migration_test2/best_policy.pt  --play --render
+ python examples/train_gradnav.py --cfg examples/cfg/gradnav/drone_test.yaml --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/gradnav_test_0212/gate_mid_new/02-12-2026-17-28-39/best_policy.pt  --play --render
  ```
 
  ## To continue training a gradnav policy (with bug potential):
@@ -536,7 +556,7 @@ python examples/train_gradnav_dynamic.py \
 ```bash
 python examples/train_gradnav_dynamic.py \
       --cfg examples/cfg/gradnav/drone_dynamic_curriculum.yaml \
-      --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/gradnav_curriculum/gate_mid/01-20-2026-15-44-29/best_policy.pt \
+      --checkpoint /home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/gradnav_test_0212/gate_mid_new/02-12-2026-17-28-39/best_policy.pt \
       --play --render
 ```
 

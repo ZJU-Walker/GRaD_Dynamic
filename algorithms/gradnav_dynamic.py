@@ -196,6 +196,7 @@ class GradNavDynamic:
 
         # vel_net fine-tuning setup
         self.vel_net_cfg = vel_net_cfg if vel_net_cfg is not None else {}
+        self.vel_net_enabled = self.vel_net_cfg.get('enabled', False)
         self.vel_net_finetune = self.vel_net_cfg.get('finetune', False)
         self.vel_net_finetune_start_iter = self.vel_net_cfg.get('finetune_start_iter', 200)
         self.vel_net_lr = float(self.vel_net_cfg.get('learning_rate', 1e-4))
@@ -727,6 +728,10 @@ class GradNavDynamic:
                 if self.iter_count >= self.vel_net_finetune_start_iter:
                     self.start_vel_net_finetuning()
 
+            # Update GT→pred velocity curriculum (if enabled)
+            if self.vel_net_enabled:
+                self.env.update_gt_vel_curriculum(self.iter_count)
+
             # Curriculum learning: Phase 1 -> Phase 2 transition
             if self.curriculum_enabled:
                 self._update_curriculum(epoch)
@@ -914,6 +919,12 @@ class GradNavDynamic:
             self.env.current_phase = 2
             self.env.dynamic_spawn_prob = 1.0
             print_info(f"[Play Mode] Forced Phase 2 with 100% dynamic object spawn probability")
+
+        # Force 100% predicted velocity during play mode if use_pred_vel_in_obs is enabled
+        # This matches the end-of-training state where gt_vel_ratio = 0.0
+        if hasattr(self.env, 'use_pred_vel_in_obs') and self.env.use_pred_vel_in_obs:
+            self.env.gt_vel_ratio = 0.0  # 100% predicted velocity
+            print_info(f"[Play Mode] Using 100% predicted velocity (gt_vel_ratio = 0.0)")
 
         self.run(cfg['params']['config']['player']['games_num'])
 
