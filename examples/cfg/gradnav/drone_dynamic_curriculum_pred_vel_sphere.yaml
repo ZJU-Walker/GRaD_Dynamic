@@ -2,7 +2,7 @@ params:
   diff_env:
     name: DynamicDroneEnv
     stochastic_env: True
-    episode_length: 300
+    episode_length: 400
     MM_caching_frequency: 16
 
   # Dynamic obstacle configuration
@@ -21,48 +21,38 @@ params:
       width: 256   # 640 * 0.4
       height: 144  # 360 * 0.4
 
-    # List of objects to spawn (red box for Phase 2)
-    # Uses 'trajectories' list for random selection during training
+    # List of objects to spawn (slow sphere for Phase 2)
     objects:
-      - type: box
-        box_size: [1.0, 1.0, 0.05]   # width, height, depth (cube)
+      - type: sphere
+        radius: 0.5
         velocity: [0.15, 0.0, 0.0]  # Slow: 0.0-0.3 m/s
-        box_rotation: [0, 0.7071, 0, 0.7071]
-        # Random trajectory selection for better generalization
-        trajectories:
-          # - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_1.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_2.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_3.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_4.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_5.csv"
+        trajectory: "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/sphere_2.csv"
         loop: true
 
   # Curriculum learning configuration
   curriculum:
     enabled: true
-    phase1_end_iter: 50           # Phase 1: iter 0-200 (static only)
+    phase1_end_iter: 200           # Phase 1: iter 0-200 (static only)
     # Phase 2 ramping schedule: [start_iter, spawn_probability]
     # Spawn probability applies from start_iter until the next threshold
     phase2_schedule:
-      - [30, 0.3]                 # iter 200+: 30% spawn probability
-      - [50, 0.7]                 # iter 300+: 70% spawn probability
-      - [80, 1.0]                 # iter 400+: 100% spawn probability
+      - [50, 0.3]                 # iter 200+: 30% spawn probability
+      - [150, 0.7]                 # iter 300+: 70% spawn probability
+      - [300, 1.0]                 # iter 400+: 100% spawn probability
 
   vel_net:
-    checkpoint_path: "/home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/vel_net_from_sim_v1/best.pt"
-    enabled: true                  # Disabled - use GT velocity only
-    vel_frame: "world"              # "body" for body frame velocity, "world" for world frame velocity
-                                    # Affects policy observations (even when vel_net disabled)
+    checkpoint_path: "/home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/vel_net_body_full_seq_straight_map_new/best_initial.pt"
+    enabled: true
     eval_compare: true
     finetune: false                 # Set true if you want to finetune vel_net during policy training
     finetune_start_iter: 200
     learning_rate: 1e-4
     finetune_encoder: false
 
-    # GT→pred velocity curriculum (only used when enabled: true and use_pred_vel_in_obs: true)
-    use_pred_vel_in_obs: true      # Enable using predicted velocity in policy observations
-    gt_vel_curriculum_start_iter: 0      # Start curriculum at iteration 0
+    # GT→pred velocity curriculum (body frame)
+    # Start with 100% GT velocity, gradually switch to 100% predicted velocity
+    use_pred_vel_in_obs: true       # Enable using predicted velocity in policy observations
+    gt_vel_curriculum_start_iter: 100      # Start curriculum at iteration 0
     gt_vel_curriculum_end_iter: 200      # End curriculum at iteration 200
     gt_vel_ratio_start: 1.0              # Start with 100% GT velocity
     gt_vel_ratio_end: 0.0                # End with 0% GT (100% predicted)

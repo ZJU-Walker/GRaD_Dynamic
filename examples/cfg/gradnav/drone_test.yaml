@@ -7,10 +7,12 @@ params:
 
   vel_net:
     checkpoint_path: "/home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/vel_net_imu_fusion/best.pt"
-    enabled: true
-    eval_compare: true
+    enabled: false  # Disabled - need to retrain vel_net with 76-dim obs (no action)
+    vel_frame: "body"               # "body" for body frame velocity, "world" for world frame velocity
+                                    # Affects both vel_net model and policy observations
+    eval_compare: false
     # Fine-tuning settings
-    finetune: true
+    finetune: false
     finetune_start_iter: 1
     learning_rate: 1e-4
     finetune_encoder: true  # Also fine-tune DualEncoder FC layers
