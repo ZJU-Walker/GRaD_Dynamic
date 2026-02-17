@@ -363,8 +363,9 @@ class ExpertDroneEnv(SimpleDroneEnv):
         # Load normalization stats
         self.vel_mean = checkpoint.get('vel_mean', torch.zeros(3)).to(self.device)
         self.vel_std = checkpoint.get('vel_std', torch.ones(3)).to(self.device)
-        self.accel_mean = checkpoint.get('accel_mean', torch.zeros(3)).to(self.device)
-        self.accel_std = checkpoint.get('accel_std', torch.ones(3)).to(self.device)
+        # imu_vel uses same normalization as vel (both are velocities)
+        self.imu_vel_mean = checkpoint.get('imu_vel_mean', self.vel_mean).to(self.device)
+        self.imu_vel_std = checkpoint.get('imu_vel_std', self.vel_std).to(self.device)
         self.delta_mean = checkpoint.get('delta_mean', torch.zeros(3)).to(self.device)
         self.delta_std = checkpoint.get('delta_std', torch.ones(3)).to(self.device)
 
@@ -627,7 +628,7 @@ class ExpertDroneEnv(SimpleDroneEnv):
         print(f"[vel_net] Saved velocity comparison plot to {save_path}")
         print(f"[vel_net] MAE: {mae:.4f} m/s over {T} steps")
 
-    def _build_vel_net_obs_and_infer(self, torso_quat, lin_vel_body, lin_vel_world, lin_acceleration):
+    def _build_vel_net_obs_and_infer(self, torso_quat, lin_vel_body, lin_vel_world):
         """Build vel_net observation and run inference for evaluation comparison.
 
         Velocities are in BODY FRAME for vel_net_body, WORLD FRAME for vel_net.
@@ -636,7 +637,6 @@ class ExpertDroneEnv(SimpleDroneEnv):
             torso_quat: Quaternion (N, 4) in xyzw format
             lin_vel_body: Ground truth linear velocity in body frame (N, 3)
             lin_vel_world: Ground truth linear velocity in world frame (N, 3)
-            lin_acceleration: Linear acceleration (N, 3) - used as IMU input (world frame)
         """
         # Select velocity based on frame setting
         gt_vel = lin_vel_body if self.vel_frame == 'body' else lin_vel_world
@@ -647,8 +647,10 @@ class ExpertDroneEnv(SimpleDroneEnv):
         # Normalize previous predicted velocity for input
         prev_vel_normalized = (self.pred_vel_prev - self.vel_mean) / (self.vel_std + 1e-8)
 
-        # Normalize acceleration for input
-        accel_normalized = (lin_acceleration.detach() - self.accel_mean) / (self.accel_std + 1e-8)
+        # Normalize IMU velocity for input (use GT velocity as IMU velocity in simulation)
+        # In real deployment, this would come from IMU topic
+        imu_vel = gt_vel.detach()  # Use GT velocity as IMU velocity
+        imu_vel_normalized = (imu_vel - self.imu_vel_mean) / (self.imu_vel_std + 1e-8)
 
         # Build vel_net observation (76 dims, no action)
         # Detach inputs to ensure vel_net has its own computation graph separate from actor
@@ -657,7 +659,7 @@ class ExpertDroneEnv(SimpleDroneEnv):
             prev_vel=prev_vel_normalized,                   # 6:9 (normalized)
             rgb_feat=self.rgb_feat_vel.detach(),            # 9:41
             depth_feat=self.depth_feat_vel.detach(),        # 41:73
-            accel=accel_normalized,                         # 73:76 (normalized IMU)
+            imu_vel=imu_vel_normalized,                     # 73:76 (normalized IMU velocity)
         )
 
         # Store data for vel_net training (if fine-tuning enabled)
@@ -984,7 +986,7 @@ class ExpertDroneEnv(SimpleDroneEnv):
         # vel_net observation and inference (BEFORE obs_buf so we can use pred_vel)
         # Pass both body and world frame GT velocities
         if self.vel_net_enabled and self.vel_net is not None:
-            self._build_vel_net_obs_and_infer(torso_quat, lin_vel_body, lin_vel, lin_acceleration)
+            self._build_vel_net_obs_and_infer(torso_quat, lin_vel_body, lin_vel)
 
         # Select GT velocity based on frame setting for policy observation
         gt_vel_for_obs = lin_vel_body if self.vel_frame == 'body' else lin_vel
