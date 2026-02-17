@@ -137,8 +137,8 @@ def fly_and_evaluate(
     encoder: DualEncoder,
     vel_mean: torch.Tensor,
     vel_std: torch.Tensor,
-    accel_mean: torch.Tensor = None,
-    accel_std: torch.Tensor = None,
+    imu_vel_mean: torch.Tensor = None,
+    imu_vel_std: torch.Tensor = None,
     delta_mean: torch.Tensor = None,
     delta_std: torch.Tensor = None,
     map_name: str = None,
@@ -161,8 +161,8 @@ def fly_and_evaluate(
         encoder: Trained DualEncoder
         vel_mean: Velocity mean for normalizing INPUT prev_vel (3,)
         vel_std: Velocity std for normalizing INPUT prev_vel (3,)
-        accel_mean: Accel mean for normalizing INPUT accel (3,)
-        accel_std: Accel std for normalizing INPUT accel (3,)
+        imu_vel_mean: IMU velocity mean for normalizing INPUT imu_vel (3,)
+        imu_vel_std: IMU velocity std for normalizing INPUT imu_vel (3,)
         delta_mean: Delta mean for denormalizing delta_v OUTPUT (3,)
         delta_std: Delta std for denormalizing delta_v OUTPUT (3,)
         map_name: GS/point cloud map name. If None, uses the map from waypoints config.
@@ -172,7 +172,7 @@ def fly_and_evaluate(
         device: PyTorch device
         max_steps: Maximum simulation steps
         smoothing: B-spline corner smoothing
-        imu_noise: Whether to add IMU noise augmentation (for realistic testing)
+        imu_noise: Whether to add IMU velocity noise augmentation (for realistic testing)
         action_noise: Action noise std (0.0-0.3), adds random noise to body rates
 
     Returns:
@@ -183,8 +183,9 @@ def fly_and_evaluate(
 
     vel_mean = vel_mean.to(device)
     vel_std = vel_std.to(device)
-    accel_mean = accel_mean.to(device) if accel_mean is not None else torch.zeros(3, device=device)
-    accel_std = accel_std.to(device) if accel_std is not None else torch.ones(3, device=device)
+    # IMU velocity uses same normalization as velocity if not specified
+    imu_vel_mean = imu_vel_mean.to(device) if imu_vel_mean is not None else vel_mean
+    imu_vel_std = imu_vel_std.to(device) if imu_vel_std is not None else vel_std
     delta_mean = delta_mean.to(device) if delta_mean is not None else torch.zeros(3, device=device)
     delta_std = delta_std.to(device) if delta_std is not None else torch.ones(3, device=device)
 
@@ -312,9 +313,8 @@ def fly_and_evaluate(
     prev_vel_raw = torch.zeros(3, device=device)
     prev_vel_norm = (prev_vel_raw - vel_mean) / vel_std
 
-    # Track previous GT velocity for IMU acceleration computation
+    # Track previous GT velocity for reference
     prev_vel_gt = np.zeros(3)
-    model_dt = getattr(model, 'dt', 1.0 / 30.0)  # Model's expected dt
 
     # Reset GRU hidden state for sequential processing
     model.reset_hidden_state(batch_size=1)
@@ -405,30 +405,30 @@ def fly_and_evaluate(
                 quat_tensor = torch.from_numpy(quat_xyzw.astype(np.float32)).unsqueeze(0).to(device)
                 rot6d = quaternion_to_rot6d(quat_tensor)
 
-                # Compute IMU acceleration from GT velocity derivative
-                accel_gt = (vel_gt - prev_vel_gt) / model_dt
+                # Use GT velocity as IMU velocity (in real deployment, this comes from IMU topic)
+                imu_vel_gt = vel_gt.copy()
 
-                # Apply IMU noise if enabled (matches training augmentation)
+                # Apply IMU velocity noise if enabled (matches training augmentation)
                 if imu_noise:
-                    accel_aug = accel_gt.copy()
-                    accel_aug = accel_aug + imu_bias  # constant bias per flight
-                    accel_aug = accel_aug * imu_scale  # constant scale per flight
-                    accel_aug = accel_aug + np.random.normal(0, imu_aug.noise_std, size=3)  # per-frame noise
+                    imu_vel_aug = imu_vel_gt.copy()
+                    imu_vel_aug = imu_vel_aug + imu_bias  # constant bias per flight
+                    imu_vel_aug = imu_vel_aug * imu_scale  # constant scale per flight
+                    imu_vel_aug = imu_vel_aug + np.random.normal(0, imu_aug.noise_std, size=3)  # per-frame noise
                     if np.random.random() < imu_aug.dropout_prob:  # sensor dropout
-                        accel_aug = np.zeros(3)
-                    accel_tensor = torch.from_numpy(accel_aug.astype(np.float32)).unsqueeze(0).to(device)
+                        imu_vel_aug = np.zeros(3)
+                    imu_vel_tensor = torch.from_numpy(imu_vel_aug.astype(np.float32)).unsqueeze(0).to(device)
                 else:
-                    accel_tensor = torch.from_numpy(accel_gt.astype(np.float32)).unsqueeze(0).to(device)
+                    imu_vel_tensor = torch.from_numpy(imu_vel_gt.astype(np.float32)).unsqueeze(0).to(device)
 
-                # Normalize acceleration for input
-                accel_norm = (accel_tensor - accel_mean) / accel_std
+                # Normalize IMU velocity for input
+                imu_vel_norm = (imu_vel_tensor - imu_vel_mean) / imu_vel_std
 
                 obs = torch.cat([
                     rot6d,           # 6
                     prev_vel_norm.unsqueeze(0),   # 3 (normalized)
                     rgb_feat,        # 32
                     depth_feat,      # 32
-                    accel_norm,      # 3 (normalized IMU acceleration)
+                    imu_vel_norm,    # 3 (normalized IMU velocity)
                 ], dim=1)
 
                 # Model outputs delta_v (normalized) - use encode_step for GRU state
@@ -448,7 +448,7 @@ def fly_and_evaluate(
             vel_pred_list.append(vel_pred.copy())
             timestamps.append(t)
 
-        # Always update prev_vel_gt for next acceleration computation (even during stabilization)
+        # Update prev_vel_gt for reference (even during stabilization)
         prev_vel_gt = vel_gt.copy()
 
         # Record frame for video

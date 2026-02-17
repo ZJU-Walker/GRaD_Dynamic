@@ -113,7 +113,7 @@ def train_command(args):
         val_ratio=args.val_ratio,
     )
 
-    # Create model (76 dims: rot6d=6 + prev_vel=3 + rgb=32 + depth=32 + accel=3)
+    # Create model (76 dims: rot6d=6 + prev_vel=3 + rgb=32 + depth=32 + imu_vel=3)
     model = VELO_NET(
         num_obs=76,  # No action, compatible with vel_net_body data format
         stack_size=1,
@@ -164,8 +164,8 @@ def train_command(args):
             test_sequence_path=test_seq,
             vel_mean=trainer.vel_mean,
             vel_std=trainer.vel_std,
-            accel_mean=trainer.accel_mean,
-            accel_std=trainer.accel_std,
+            imu_vel_mean=trainer.imu_vel_mean,
+            imu_vel_std=trainer.imu_vel_std,
             delta_mean=trainer.delta_mean,
             delta_std=trainer.delta_std,
             device=device,
@@ -204,14 +204,15 @@ def test_command(args):
     # Load normalization stats
     vel_mean = checkpoint.get('vel_mean', torch.zeros(3))
     vel_std = checkpoint.get('vel_std', torch.ones(3))
-    accel_mean = checkpoint.get('accel_mean', torch.zeros(3))
-    accel_std = checkpoint.get('accel_std', torch.ones(3))
+    # IMU velocity uses same normalization as velocity (or load from checkpoint if available)
+    imu_vel_mean = checkpoint.get('imu_vel_mean', vel_mean)
+    imu_vel_std = checkpoint.get('imu_vel_std', vel_std)
     delta_mean = checkpoint.get('delta_mean', torch.zeros(3))
     delta_std = checkpoint.get('delta_std', torch.ones(3))
     direct_delta_mode = checkpoint.get('direct_delta_mode', checkpoint.get('residual_mode', False))
 
     print(f"  Velocity norm (input): mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
-    print(f"  Accel norm (input):    mean={accel_mean.cpu().numpy()}, std={accel_std.cpu().numpy()}")
+    print(f"  IMU vel norm (input):  mean={imu_vel_mean.cpu().numpy()}, std={imu_vel_std.cpu().numpy()}")
     if direct_delta_mode:
         print(f"  Delta norm (output):   mean={delta_mean.cpu().numpy()}, std={delta_std.cpu().numpy()}")
         print(f"  Mode: DIRECT DELTA-V (vel_pred = prev_vel + delta_v)")
@@ -225,8 +226,8 @@ def test_command(args):
         test_sequence_path=args.test_seq,
         vel_mean=vel_mean,
         vel_std=vel_std,
-        accel_mean=accel_mean,
-        accel_std=accel_std,
+        imu_vel_mean=imu_vel_mean,
+        imu_vel_std=imu_vel_std,
         delta_mean=delta_mean,
         delta_std=delta_std,
         device=device,
@@ -266,14 +267,15 @@ def eval_command(args):
     # Load normalization stats
     vel_mean = checkpoint.get('vel_mean', torch.zeros(3))
     vel_std = checkpoint.get('vel_std', torch.ones(3))
-    accel_mean = checkpoint.get('accel_mean', torch.zeros(3))
-    accel_std = checkpoint.get('accel_std', torch.ones(3))
+    # IMU velocity uses same normalization as velocity (or load from checkpoint if available)
+    imu_vel_mean = checkpoint.get('imu_vel_mean', vel_mean)
+    imu_vel_std = checkpoint.get('imu_vel_std', vel_std)
     delta_mean = checkpoint.get('delta_mean', torch.zeros(3))
     delta_std = checkpoint.get('delta_std', torch.ones(3))
     direct_delta_mode = checkpoint.get('direct_delta_mode', checkpoint.get('residual_mode', False))
 
     print(f"  Velocity norm (input): mean={vel_mean.cpu().numpy()}, std={vel_std.cpu().numpy()}")
-    print(f"  Accel norm (input):    mean={accel_mean.cpu().numpy()}, std={accel_std.cpu().numpy()}")
+    print(f"  IMU vel norm (input):  mean={imu_vel_mean.cpu().numpy()}, std={imu_vel_std.cpu().numpy()}")
     if direct_delta_mode:
         print(f"  Delta norm (output):   mean={delta_mean.cpu().numpy()}, std={delta_std.cpu().numpy()}")
         print(f"  Mode: DIRECT DELTA-V (vel_pred = prev_vel + delta_v)")
@@ -286,8 +288,8 @@ def eval_command(args):
         encoder=encoder,
         vel_mean=vel_mean,
         vel_std=vel_std,
-        accel_mean=accel_mean,
-        accel_std=accel_std,
+        imu_vel_mean=imu_vel_mean,
+        imu_vel_std=imu_vel_std,
         delta_mean=delta_mean,
         delta_std=delta_std,
         map_name=args.map,
