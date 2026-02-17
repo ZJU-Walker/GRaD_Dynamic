@@ -46,7 +46,7 @@ class EnvConfig:
     survive_reward: float = 8.0
 
     # Dynamics penalties
-    lin_vel_penalty: float = -2.0
+    lin_vel_penalty: float = -3.0  # Reduced from -2.0 to allow faster movement
     action_penalty: float = -1.0
     action_change_penalty: float = -1.0
     smooth_penalty: float = -1.0
@@ -54,7 +54,7 @@ class EnvConfig:
     height_penalty: float = -2.0
 
     # Navigation rewards
-    heading_strength: float = 0.7 # 0.5
+    heading_strength: float = 5.0  # Increased to enforce facing trajectory direction
     waypoint_strength: float = 5.2 # 4.0
     target_factor: float = -4.0
     out_map_penalty: float = -1.5
@@ -65,15 +65,27 @@ class EnvConfig:
     obst_threshold: float = 0.5
 
     # Dynamic obstacle reward (for DynamicDroneEnv)
-    dynamic_obst_threshold: float = 2   # Distance threshold to apply reward (meters)
-    dynamic_obst_strength: float = 5.0    # Reward multiplier (higher = stronger avoidance)
+    dynamic_obst_threshold: float = 2.5   # Distance threshold to apply reward (meters)
+    dynamic_obst_strength: float = 12.0   # Reward multiplier (higher = stronger avoidance)
 
     # Phase 2 danger-aware reward weights (curriculum training)
-    k_retreat: float = 12.0           # Retreat reward weight (encourage increasing distance when danger)
-    k_no_forward: float = 10.0           # No-forward penalty weight (discourage forward when danger)
-    k_backward: float = 0.5             # Backward regularization weight (prevent always reversing)
-    danger_dist_threshold: float = 2.0  # Distance threshold for danger detection (meters)
-    danger_ttc_threshold: float = 3.0   # TTC threshold for danger detection (seconds)
+    k_retreat: float = 0.0            # Disabled - don't reward retreating/turning away
+    k_no_forward: float = 15.0        # No-forward penalty weight (STRONG - discourage forward when danger)
+    k_backward: float = 0.5           # Backward regularization weight (prevent always reversing)
+    danger_dist_threshold: float = 3.5  # Distance threshold for danger detection (meters) - detect earlier
+    danger_ttc_threshold: float = 5.0   # TTC threshold for danger detection (seconds) - longer window
+
+    # Trajectory following (encourages waiting instead of deviating around obstacles)
+    traj_deviation_penalty: float = -3.0  # Penalty for lateral deviation from reference trajectory
+
+    # Forward progress reward (encourages moving forward when safe)
+    forward_progress_weight: float = 0.0   # DISABLED - was causing rushing behavior
+    min_forward_vel: float = 0.3           # Minimum desired forward velocity (m/s)
+    safe_dist_threshold: float = 3.0       # Distance beyond which drone should move forward
+
+    # Wait reward (encourages hovering/low velocity when danger detected)
+    k_wait: float = 10.0                   # Reward for low velocity when in danger zone
+    wait_vel_threshold: float = 0.15        # Velocity below this is considered "waiting" (m/s)
 
     # ==========================================================================
     # Environment Parameters
@@ -150,11 +162,11 @@ def get_config(map_name: str = "gate_mid") -> EnvConfig:
             map_name="gate_mid_new",
             gs_folder="gate_mid_new",
             ply_file="gate_mid_new.ply",
-            start_pos=[0.0, 0.0, 1.25],
+            start_pos=[0.0, 0.3, 1.25],
             waypoints=[
-                [3.0, 0.3, 1.3],
+                [6.0, 0.3, 1.3],
             ],
-            target_pos=[6, 0.3, 1.3],
+            target_pos=[7, 0.3, 1.3],
         )
 
     else:

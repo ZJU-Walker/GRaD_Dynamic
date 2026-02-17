@@ -6,6 +6,7 @@ import torch
 from .config import EnvConfig
 from utils.torch_utils import normalize
 from utils.rotation import quaternion_yaw_forward
+from models.vel_net_body.vel_obs_utils_body import transform_worldvel_to_bodyvel
 
 
 def calculate_reward(
@@ -24,7 +25,9 @@ def calculate_reward(
     point_cloud_offset: torch.Tensor,   # (1, 3) - self.point_could_origin_offset
     num_envs: int,
     device: str = 'cuda:0',
-) -> torch.Tensor:
+    vel_frame: str = 'body',            # 'body' or 'world' - velocity frame in obs_buf
+    return_components: bool = False,    # If True, also return individual reward components
+):
     """
     Calculate total reward. Preserves original calculation from drone_long_traj.py.
 
@@ -95,11 +98,45 @@ def calculate_reward(
     target_list[valid_indices] = targets
     target_list = target_list - point_cloud_offset
 
-    desire_velo_norm = (target_list - privilege_obs_buf[:, 0:3]) / torch.clamp(
+    # === 11b. Trajectory deviation penalty ===
+    # Penalize lateral (Y, Z) deviation from reference trajectory to encourage waiting
+    # instead of deviating around obstacles
+    # Find closest point on ref_traj to current position (by X coordinate)
+    drone_pos = privilege_obs_buf[:, 0:3]
+    drone_x = drone_pos[:, 0] + point_cloud_offset[0, 0]
+
+    # Find closest ref_traj point by X distance
+    x_dist = torch.abs(ref_traj_x.unsqueeze(0) - drone_x.unsqueeze(1))  # (num_envs, num_points)
+    closest_indices = torch.argmin(x_dist, dim=1)  # (num_envs,)
+    closest_ref_points = ref_traj[closest_indices] - point_cloud_offset  # (num_envs, 3)
+
+    # Compute lateral deviation (Y and Z distance from trajectory)
+    lateral_deviation = torch.sqrt(
+        (drone_pos[:, 1] - closest_ref_points[:, 1]) ** 2 +
+        (drone_pos[:, 2] - closest_ref_points[:, 2]) ** 2
+    )
+    traj_deviation_penalty = lateral_deviation * cfg.traj_deviation_penalty
+
+    # Desired velocity direction in WORLD frame
+    desire_velo_world = (target_list - privilege_obs_buf[:, 0:3]) / torch.clamp(
         torch.norm(target_list - privilege_obs_buf[:, 0:3], dim=1, keepdim=True), min=1e-6)
-    curr_velo_norm = obs_buf[:, 14:17] / torch.clamp(
-        torch.norm(obs_buf[:, 14:17], dim=1, keepdim=True), min=1e-2)
-    velo_dist = torch.norm(curr_velo_norm - desire_velo_norm, dim=1)
+
+    # Get current velocity from obs_buf (frame depends on vel_frame setting)
+    curr_velo = obs_buf[:, 14:17]
+    curr_velo_norm = curr_velo / torch.clamp(
+        torch.norm(curr_velo, dim=1, keepdim=True), min=1e-2)
+
+    # Compare velocities in the same frame
+    if vel_frame == 'body':
+        # Transform desired direction to BODY frame to match obs_buf velocity
+        torso_quat = obs_buf[:, 2:6].detach()  # (x,y,z,w)
+        desire_velo_compare = transform_worldvel_to_bodyvel(desire_velo_world.detach(), torso_quat)
+    else:
+        # World frame: compare world frame velocities directly
+        desire_velo_compare = desire_velo_world.detach()
+
+    # Compare in the same frame
+    velo_dist = torch.norm(curr_velo_norm - desire_velo_compare, dim=1)
     target_reward = velo_dist * cfg.target_factor
 
     # === 12. Obstacle reward === (lines 751-757)
@@ -125,8 +162,27 @@ def calculate_reward(
         smooth_penalty +
         height_penalty +
         out_map_penalty +
-        wp_reward
+        wp_reward +
+        traj_deviation_penalty  # Penalize lateral deviation from ref trajectory
     )
+
+    if return_components:
+        components = {
+            'survive_reward': survive_reward,
+            'heading_reward': heading_reward,
+            'target_reward': target_reward,
+            'wp_reward': wp_reward,
+            'obst_reward': obst_reward,
+            'traj_deviation_penalty': traj_deviation_penalty,
+            'action_penalty': action_penalty,
+            'action_change_penalty': action_change_penalty,
+            'smooth_penalty': smooth_penalty,
+            'lin_vel_reward': lin_vel_reward,
+            'pose_penalty': pose_penalty,
+            'height_penalty': height_penalty,
+            'out_map_penalty': out_map_penalty,
+        }
+        return reward, components
 
     return reward
 

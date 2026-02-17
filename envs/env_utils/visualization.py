@@ -8,6 +8,7 @@ import torch
 import matplotlib.pyplot as plt
 from torchvision.io import write_video
 from torchvision.transforms import Resize
+import cv2
 
 
 class VisualizationRecorder:
@@ -40,6 +41,52 @@ class VisualizationRecorder:
 
         self.img_transform = Resize((360, 640), antialias=True)
 
+    def _overlay_text_on_image(self, img_tensor, text_lines):
+        """
+        Overlay text on image tensor.
+
+        Args:
+            img_tensor: (C, H, W) tensor with values in [0, 1] or [0, 255]
+            text_lines: list of strings to overlay
+
+        Returns:
+            img_tensor with text overlay (same range as input)
+        """
+        # Convert to numpy HWC for cv2
+        img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
+
+        # Check if image is in [0, 1] or [0, 255] range
+        is_normalized = img_np.max() <= 1.0
+
+        if is_normalized:
+            img_np = (img_np * 255).astype(np.uint8)
+        else:
+            img_np = img_np.astype(np.uint8)
+
+        img_np = np.ascontiguousarray(img_np)
+
+        # Draw text
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+        color = (255, 255, 255)  # White
+        shadow_color = (0, 0, 0)  # Black shadow for readability
+
+        y_offset = 30
+        for i, text in enumerate(text_lines):
+            y = y_offset + i * 28
+            # Draw shadow
+            cv2.putText(img_np, text, (12, y+2), font, font_scale, shadow_color, thickness+1)
+            # Draw text
+            cv2.putText(img_np, text, (10, y), font, font_scale, color, thickness)
+
+        # Convert back to tensor (same range as input)
+        if is_normalized:
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float() / 255.0
+        else:
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1).float()
+        return img_tensor
+
     def record_visualization_data(self, torso_pos, ang_vel, lin_vel, rpy_data,
                                     actions, rgb_img, depth_list):
         """
@@ -59,6 +106,18 @@ class VisualizationRecorder:
         # Process image for video (lines 803-804)
         rgb_img = torch.permute(rgb_img[0], (2, 0, 1))
         img = self.img_transform(rgb_img)
+
+        # Get velocity data for overlay
+        velo_data = lin_vel.clone().detach().cpu().numpy()
+        vx, vy, vz = velo_data[0, 0], velo_data[0, 1], velo_data[0, 2]
+        vel_mag = np.sqrt(vx**2 + vy**2 + vz**2)
+
+        # Overlay velocity text on image
+        text_lines = [
+            f"Vel: [{vx:.2f}, {vy:.2f}, {vz:.2f}] m/s",
+            f"|V|: {vel_mag:.2f} m/s",
+        ]
+        img = self._overlay_text_on_image(img, text_lines)
 
         # Convert to numpy (lines 806-810)
         pos_data = torso_pos.clone().detach().cpu().numpy()
@@ -82,7 +141,8 @@ class VisualizationRecorder:
         self.ang_velo_y_record.append(ang_vel_data[0, 1])
         self.ang_velo_z_record.append(ang_vel_data[0, 2])
         self.depth_record.append(depth_data[0] / 2)
-        self.img_record.append(img)
+        # Move image to CPU to avoid device mismatch and save GPU memory
+        self.img_record.append(img.cpu())
 
         # Record actions (lines 827-829)
         if self.episode_count < self.episode_length:
@@ -144,8 +204,52 @@ class VisualizationRecorder:
         plt.plot(range(len(self.velo_z_record)), self.velo_z_record)
         plt.xlabel("Step")
         plt.ylabel("m/s")
-        plt.legend(['vx', 'vy', 'vz', 'vae_vx', 'vae_vy', 'vae_vz'])
+        plt.legend(['vx', 'vy', 'vz'])
         plt.savefig(f'{save_path}/velo_plot.png')
+
+        # figure forward velocity (body-frame forward + velocity magnitude)
+        plt.figure(figsize=(12, 8))
+
+        # Compute forward velocity (velocity projected onto heading direction)
+        vx = np.array(self.velo_x_record)
+        vy = np.array(self.velo_y_record)
+        vz = np.array(self.velo_z_record)
+        yaw = np.array(self.yaw_record)
+
+        # Forward velocity = vx * cos(yaw) + vy * sin(yaw)
+        v_forward = vx * np.cos(yaw) + vy * np.sin(yaw)
+        # Lateral velocity = -vx * sin(yaw) + vy * cos(yaw)
+        v_lateral = -vx * np.sin(yaw) + vy * np.cos(yaw)
+        # Velocity magnitude (horizontal)
+        v_mag_horizontal = np.sqrt(vx**2 + vy**2)
+        # Velocity magnitude (3D)
+        v_mag_3d = np.sqrt(vx**2 + vy**2 + vz**2)
+
+        plt.subplot(2, 1, 1)
+        plt.plot(range(len(v_forward)), v_forward, 'b-', linewidth=2, label='Forward (body X)')
+        plt.plot(range(len(v_lateral)), v_lateral, 'g-', linewidth=1.5, label='Lateral (body Y)')
+        plt.plot(range(len(vz)), vz, 'r-', linewidth=1.5, label='Vertical (Z)')
+        plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        plt.xlabel("Step")
+        plt.ylabel("m/s")
+        plt.title("Body-Frame Velocity Components")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.subplot(2, 1, 2)
+        plt.plot(range(len(v_mag_horizontal)), v_mag_horizontal, 'b-', linewidth=2, label='Horizontal |V|')
+        plt.plot(range(len(v_mag_3d)), v_mag_3d, 'r-', linewidth=2, label='3D |V|')
+        plt.plot(range(len(v_forward)), v_forward, 'g--', linewidth=1.5, alpha=0.7, label='Forward V')
+        plt.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+        plt.xlabel("Step")
+        plt.ylabel("m/s")
+        plt.title("Velocity Magnitude")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(f'{save_path}/forward_velo_plot.png')
+        print(f"  Forward velocity plot saved: {save_path}/forward_velo_plot.png")
 
         # figure action (lines 882-898)
         plt.figure()
@@ -167,7 +271,9 @@ class VisualizationRecorder:
         plt.savefig(f'{save_path}/action_force_plot.png')
 
         # save video (lines 901-904)
-        video_tensor = torch.permute(torch.stack(self.img_record), (0, 2, 3, 1)) * 255
+        # Move all images to CPU before stacking to avoid device mismatch
+        img_record_cpu = [img.cpu() if isinstance(img, torch.Tensor) else img for img in self.img_record]
+        video_tensor = torch.permute(torch.stack(img_record_cpu), (0, 2, 3, 1)) * 255
         video_tensor = video_tensor.to('cpu')
         video_tensor_uint8 = video_tensor.to(dtype=torch.uint8)
         write_video(f'{save_path}/ego_video.mp4', video_tensor_uint8, fps=20)
