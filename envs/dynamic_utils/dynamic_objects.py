@@ -114,7 +114,8 @@ class RandomWalkPattern(MovementPattern):
 
 class TrajectoryPattern(MovementPattern):
     """Movement pattern based on predefined trajectory from CSV file"""
-    def __init__(self, trajectory_file: str, loop: bool = True, device: str = 'cuda'):
+    def __init__(self, trajectory_file: str, loop: bool = True, device: str = 'cuda',
+                 randomize_start_time: bool = True, eval_time_offset: float = None):
         self.trajectory_loader = TrajectoryLoader(
             csv_file=trajectory_file,
             loop=loop,
@@ -122,6 +123,17 @@ class TrajectoryPattern(MovementPattern):
         )
         self.device = device
         self.last_time = 0.0
+        self.randomize_start_time = randomize_start_time
+        self.eval_time_offset = eval_time_offset
+
+        # Set initial time offset
+        self.time_offset = 0.0
+        if self.eval_time_offset is not None:
+            # Fixed offset for eval — deterministic, reproducible
+            self.time_offset = self.eval_time_offset
+        elif self.randomize_start_time and self.trajectory_loader.duration > 0:
+            self.time_offset = random.uniform(-5, 10)
+        self.trajectory_loader.current_time = self.time_offset
 
     def get_velocity(self, position, time):
         dt = time - self.last_time
@@ -132,11 +144,17 @@ class TrajectoryPattern(MovementPattern):
         return velocity
 
     def get_position(self, time):
-        return self.trajectory_loader.get_position_at_time(time)
+        return self.trajectory_loader.get_position_at_time(time + self.time_offset)
 
     def reset(self):
         self.trajectory_loader.reset()
         self.last_time = 0.0
+        # Re-set time offset on reset
+        if self.eval_time_offset is not None:
+            self.time_offset = self.eval_time_offset
+        elif self.randomize_start_time and self.trajectory_loader.duration > 0:
+            self.time_offset = random.uniform(-5, 10)
+        self.trajectory_loader.current_time = self.time_offset
 
 
 class DynamicObjectManager:
@@ -269,8 +287,8 @@ class DynamicObjectManager:
                         self.time[env_id].item()
                     )
 
-        # Update positions
-        self.positions += self.velocities * dt * mask
+        # Update positions (out-of-place to avoid breaking autograd)
+        self.positions = self.positions + self.velocities * dt * mask
 
     def get_distances_to_point(self, points: torch.Tensor):
         """
