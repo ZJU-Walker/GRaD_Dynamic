@@ -244,10 +244,12 @@ class DynamicDroneEnv(ExpertDroneEnv):
                 if selected_trajectory:
                     try:
                         # Create trajectory pattern
+                        eval_time_offset = obj_cfg.get('eval_time_offset', None)
                         pattern = TrajectoryPattern(
                             trajectory_file=selected_trajectory,
                             loop=obj_cfg.get('loop', True),
                             device=self.device,
+                            eval_time_offset=eval_time_offset,
                         )
                         # Get initial position from trajectory
                         init_pos = pattern.get_position(0.0)
@@ -556,17 +558,16 @@ class DynamicDroneEnv(ExpertDroneEnv):
                 # (3) Backward penalty: small regularization to prevent always reversing
                 r_back_pen = -self.cfg.k_backward * torch.clamp(-forward_vel_clamped, min=0)
 
-                # (4) Wait reward: explicitly reward low velocity (hovering) when danger detected
-                # This encourages "stop and wait" behavior instead of rushing
-                # Use blended velocity when use_pred_vel_in_obs is enabled (consistency with obs)
+                # (4) Continuous velocity-danger penalty: penalize velocity proportional to danger
+                # Replaces binary wait reward — gives gradient at ALL velocities
+                # Slowing from 2.0->1.0 m/s is rewarded, not just crossing a threshold
                 if self.vel_net_enabled and self.use_pred_vel_in_obs:
                     gt_vel = self.state_joint_qd[:, 3:6].detach()
                     blended_vel = self.get_blended_velocity(gt_vel)
                     vel_magnitude = torch.norm(blended_vel, dim=1)
                 else:
-                    vel_magnitude = torch.norm(self.state_joint_qd[:, 3:6], dim=1)  # GT velocity magnitude
-                is_waiting = vel_magnitude < self.cfg.wait_vel_threshold  # True if velocity below threshold
-                r_wait = self.cfg.k_wait * danger_t.float() * is_waiting.float()
+                    vel_magnitude = torch.norm(self.state_joint_qd[:, 3:6].detach(), dim=1)
+                r_wait = -self.cfg.k_wait * danger_t.float() * vel_magnitude
 
                 # Combine Phase 2 rewards
                 phase2_reward = r_retreat + r_no_forward + r_back_pen + r_wait
@@ -750,9 +751,9 @@ class DynamicDroneEnv(ExpertDroneEnv):
         """Update visual features with augmented images."""
         import torch.nn as nn
 
-        _, H, _, _ = depth_list.shape
-        depth_list_up = depth_list[:, 0:int(H/2), :, :]
-        self.depth_list = torch.abs(torch.amin(depth_list_up, dim=(1, 2, 3))).unsqueeze(1).to(device=self.device)
+        # _, H, _, _ = depth_list.shape
+        # depth_list_up = depth_list[:, 0:int(H/2), :, :]
+        self.depth_list = torch.abs(torch.amin(depth_list, dim=(1, 2, 3))).unsqueeze(1).to(device=self.device)
 
         # For policy (SqueezeNet): use 224x224 resized images
         visual_tensor = rgb_img.permute(0, 3, 1, 2)
