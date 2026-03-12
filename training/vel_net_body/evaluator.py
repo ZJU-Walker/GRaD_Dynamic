@@ -28,9 +28,9 @@ from controller.nav_helpers import (
     save_trajectory_topdown,
     save_trajectory_profile,
 )
-from models.vel_net_body import VELO_NET_BODY
+from models.vel_net_body_legacy import VELO_NET_BODY
 from models.vel_net.visual_encoder import DualEncoder  # Shared visual encoder
-from models.vel_net_body.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
+from models.vel_net_body_legacy.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
 from training.vel_net.dataset import IMUAugmentation
 
 

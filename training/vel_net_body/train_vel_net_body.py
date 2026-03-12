@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 import argparse
 import torch
 
-from models.vel_net_body import VELO_NET_BODY
+from models.vel_net_body_legacy import VELO_NET_BODY
 from models.vel_net.visual_encoder import DualEncoder  # Shared visual encoder
 
 

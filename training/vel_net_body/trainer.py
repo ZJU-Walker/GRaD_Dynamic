@@ -41,7 +41,7 @@ from typing import Optional, Dict, Tuple, List
 import numpy as np
 from tqdm import tqdm
 
-from models.vel_net_body import VELO_NET_BODY
+from models.vel_net_body_legacy import VELO_NET_BODY
 from models.vel_net.visual_encoder import DualEncoder  # Shared visual encoder
 
 try:
@@ -292,7 +292,7 @@ class VelNetTrainer:
         Loss is computed on the delta_v (normalized).
         IMU acceleration is used as an input feature but NOT for physics integration.
         """
-        from models.vel_net_body.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
+        from models.vel_net_body_legacy.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
 
         self.model.train()
         self.encoder.train()
@@ -469,7 +469,7 @@ class VelNetTrainer:
         DIRECT DELTA-V MODE: Model outputs delta_v, velocity = prev_vel + delta_v
         Note: Validation uses clean accel (no augmentation) as input feature.
         """
-        from models.vel_net_body.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
+        from models.vel_net_body_legacy.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
 
         self.model.eval()
         self.encoder.eval()
@@ -709,7 +709,7 @@ def autoregressive_test(
         delta_std: Delta std for denormalizing delta_v OUTPUT (3,)
     """
     from PIL import Image
-    from models.vel_net_body.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
+    from models.vel_net_body_legacy.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
 
     model.eval()
     encoder.eval()

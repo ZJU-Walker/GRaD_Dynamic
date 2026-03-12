@@ -24,7 +24,7 @@ from torch.utils.data import Dataset, DataLoader
 from typing import Optional, List, Tuple, Dict
 import glob
 
-from models.vel_net_body.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
+from models.vel_net_body_legacy.vel_obs_utils_body import quaternion_to_rot6d, transform_worldvel_to_bodyvel
 
 
 class IMUAugmentation:
