@@ -27,9 +27,9 @@ from utils.time_report import TimeReport
 from models.policy.squeeze_net import VisualPerceptionNet
 from models.vel_net import VELO_NET, DualEncoder
 from models.vel_net.vel_obs_utils import quaternion_to_rot6d, build_vel_observation
-from models.vel_net_body import VELO_NET_BODY
-from models.vel_net_body.vel_obs_utils_body import quaternion_to_rot6d as quaternion_to_rot6d_body
-from models.vel_net_body.vel_obs_utils_body import transform_worldvel_to_bodyvel
+from models.vel_net_body_legacy import VELO_NET_BODY
+from models.vel_net_body_legacy.vel_obs_utils_body import quaternion_to_rot6d as quaternion_to_rot6d_body
+from models.vel_net_body_legacy.vel_obs_utils_body import transform_worldvel_to_bodyvel
 
 
 class ExpertDroneEnv(SimpleDroneEnv):
