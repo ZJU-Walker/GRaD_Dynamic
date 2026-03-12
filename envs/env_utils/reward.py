@@ -6,7 +6,7 @@ import torch
 from .config import EnvConfig
 from utils.torch_utils import normalize
 from utils.rotation import quaternion_yaw_forward
-from models.vel_net_body.vel_obs_utils_body import transform_worldvel_to_bodyvel
+from models.vel_net_body_legacy.vel_obs_utils_body import transform_worldvel_to_bodyvel
 
 
 def calculate_reward(
