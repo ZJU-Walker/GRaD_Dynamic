@@ -1,0 +1,44 @@
+# Stage 3: Joint Fine-Tuning
+# Unfreeze all branches
+# Lower LR for geometry/dynamics, higher for fusion
+
+stage: 3
+
+# Model (must match previous stages)
+model:
+  rgb_feat_dim: 32
+  flow_feat_dim: 64
+  geo_hidden_dim: 128
+  geo_gru_layers: 2
+  dyn_hidden_dim: 128
+  dyn_gru_layers: 2
+
+# Training
+training:
+  epochs: 100
+  batch_size: 8
+  lr: 1.0e-4
+  lr_geometry: 3.0e-5     # Lower LR for pre-trained geometry
+  lr_dynamics: 3.0e-5     # Lower LR for pre-trained dynamics
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  grad_accumulation_steps: 1
+  early_stop_patience: 25
+  seq_length: 64
+  stride: 32
+  val_ratio: 0.1
+
+# Scheduled sampling (for prev_vel)
+scheduled_sampling:
+  tf_start_epoch: 0
+  tf_end_epoch: 50
+
+# Loss weights
+loss:
+  velocity_weight: 2.0
+  omega_weight: 0.5
+  geometry_reg_weight: 0.1
+  scale_reg_weight: 0.1
+
+# Checkpoint
+checkpoint_dir: checkpoints/vel_net_v2

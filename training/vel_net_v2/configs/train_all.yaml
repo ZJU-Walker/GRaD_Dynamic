@@ -1,0 +1,56 @@
+# VelNetV2 — Unified 3-Stage Training Config
+# Run all stages with one command:
+#   python training/vel_net_v2/train_vel_net_v2.py train_all \
+#       --config training/vel_net_v2/configs/train_all.yaml
+
+# Shared across all stages
+data_dir: /scr/irislab/ke/data/vel_net_v2_data_0309/gate_mid
+checkpoint_dir: checkpoints/vel_net/vel_net_v2_0309_1
+device: cuda:0
+wandb: true
+wandb_project: vel_net_v2
+
+# Model (shared, immutable across stages)
+model:
+  rgb_feat_dim: 32
+  flow_feat_dim: 64
+  geo_hidden_dim: 128
+  geo_gru_layers: 2
+  dyn_hidden_dim: 128
+  dyn_gru_layers: 2
+
+# Data (shared)
+data:
+  seq_length: 64
+  stride: 32
+  batch_size: 8
+  val_ratio: 0.1
+
+# Shared training defaults (can be overridden per-stage)
+training_defaults:
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  grad_accumulation_steps: 1
+
+# Per-stage overrides
+stages:
+  1:
+    epochs: 100
+    lr: 3.0e-4
+    tf_start_epoch: 2
+    tf_end_epoch: 50
+    early_stop_patience: 70
+  2:
+    epochs: 30
+    lr: 3.0e-4
+    tf_start_epoch: 5
+    tf_end_epoch: 25
+    early_stop_patience: 30
+  3:
+    epochs: 100
+    lr: 1.0e-4
+    lr_geometry: 3.0e-5
+    lr_dynamics: 3.0e-5
+    tf_start_epoch: 0
+    tf_end_epoch: 20
+    early_stop_patience: 25

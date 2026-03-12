@@ -1,0 +1,41 @@
+# Stage 2: Dynamics Branch Training
+# Train scale + correction heads
+# Freeze geometry branch (loaded from Stage 1)
+
+stage: 2
+
+# Model (must match Stage 1)
+model:
+  rgb_feat_dim: 32
+  flow_feat_dim: 64
+  geo_hidden_dim: 128
+  geo_gru_layers: 2
+  dyn_hidden_dim: 128
+  dyn_gru_layers: 2
+
+# Training
+training:
+  epochs: 150
+  batch_size: 8
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  grad_accumulation_steps: 1
+  early_stop_patience: 30
+  seq_length: 64
+  stride: 32
+  val_ratio: 0.1
+
+# Scheduled sampling (for prev_vel)
+scheduled_sampling:
+  tf_start_epoch: 0
+  tf_end_epoch: 80
+
+# Loss weights
+loss:
+  scale_weight: 1.0
+  velocity_weight: 2.0
+  smoothness_weight: 0.1
+
+# Checkpoint
+checkpoint_dir: checkpoints/vel_net_v2

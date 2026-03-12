@@ -1,0 +1,41 @@
+# Stage 1: Geometry Branch Training
+# Train angular velocity + translation direction heads
+# Freeze dynamics branch
+
+stage: 1
+
+# Model
+model:
+  rgb_feat_dim: 32
+  flow_feat_dim: 64
+  geo_hidden_dim: 128
+  geo_gru_layers: 2
+  dyn_hidden_dim: 128
+  dyn_gru_layers: 2
+
+# Training
+training:
+  epochs: 200
+  batch_size: 8
+  lr: 3.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  grad_accumulation_steps: 1
+  early_stop_patience: 30
+  seq_length: 64
+  stride: 32
+  val_ratio: 0.1
+
+# Scheduled sampling (for prev_vel)
+scheduled_sampling:
+  tf_start_epoch: 0
+  tf_end_epoch: 100
+
+# Loss weights
+loss:
+  omega_weight: 1.0
+  direction_weight: 1.0
+  confidence_weight: 0.5
+
+# Checkpoint
+checkpoint_dir: checkpoints/vel_net_v2
