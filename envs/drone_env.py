@@ -307,7 +307,7 @@ class SimpleDroneEnv:
         distances = self.point_cloud.compute_nearest_distances(pc_pos, quat_wxyz)
 
         # Check collision (distance < threshold)
-        collision_threshold = 0.15
+        collision_threshold = 0.05
         self.collision = distances < collision_threshold
 
     def get_state(self):
