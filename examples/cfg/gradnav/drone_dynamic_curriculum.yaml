@@ -31,12 +31,14 @@ params:
         # Random trajectory selection for better generalization
         trajectories:
           # - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_1.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_2.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_3.csv"
-          - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_4.csv"
+          # - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_1.csv"
+          # - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_2.csv"
+          # - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_3.csv"
+          # - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_4.csv"
           - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_5.csv"
+          # - "/home/irislab/ke/GRaD_Dynamic_onboard/envs/assets/trajectories/box_6.csv"
         loop: true
+        eval_time_offset: 0.0   # Uncomment for eval: fixed trajectory start time (seconds)
 
   # Curriculum learning configuration
   curriculum:
@@ -50,7 +52,7 @@ params:
       - [80, 1.0]                 # iter 400+: 100% spawn probability
 
   vel_net:
-    checkpoint_path: "/home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/vel_net_from_sim_v1/best.pt"
+    checkpoint_path: "/home/irislab/ke/GRaD_Dynamic_onboard/checkpoints/vel_net_from_sim_v2/best.pt"
     enabled: true                  # Disabled - use GT velocity only
     vel_frame: "world"              # "body" for body frame velocity, "world" for world frame velocity
                                     # Affects policy observations (even when vel_net disabled)
@@ -61,7 +63,7 @@ params:
     finetune_encoder: false
 
     # GT→pred velocity curriculum (only used when enabled: true and use_pred_vel_in_obs: true)
-    use_pred_vel_in_obs: true      # Enable using predicted velocity in policy observations
+    use_pred_vel_in_obs: false    # Enable using predicted velocity in policy observations
     gt_vel_curriculum_start_iter: 0      # Start curriculum at iteration 0
     gt_vel_curriculum_end_iter: 200      # End curriculum at iteration 200
     gt_vel_ratio_start: 1.0              # Start with 100% GT velocity
