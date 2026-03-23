@@ -1,20 +1,20 @@
 """
 Multi-stage trainer for VelNetV2.
 
-Stage 1 (Geometry): Train angular velocity + translation direction
-  - Freeze dynamics + fusion
-  - Optimize geometry branch + RGB encoder FC + FlowEncoder
-  - Loss: GeometryLoss
+Stage 1 (Rotation): Train RotationNet only
+  - Freeze TranslationBranch + Dynamics + FlowEncoder + Encoder
+  - Optimize RotationNet
+  - Loss: OmegaLoss
 
-Stage 2 (Dynamics): Train scale + correction
-  - Load from Stage 1, freeze geometry
-  - Optimize dynamics branch only
-  - Loss: DynamicsLoss
+Stage 2 (Translation): Train TranslationBranch + Dynamics + FlowEncoder
+  - Load from Stage 1, freeze RotationNet
+  - Optimize TranslationBranch + Dynamics + FlowEncoder + encoder
+  - Loss: TranslationLoss (direction + confidence + scale + velocity)
 
 Stage 3 (Joint): Fine-tune all branches
   - Load from Stage 2, unfreeze all
-  - Lower LR for geometry/dynamics, higher for fusion
-  - Loss: JointLoss
+  - Lower LR for pretrained branches
+  - Loss: JointLoss (OmegaLoss + SmoothL1(vel) + regularization)
 
 Follows same patterns as VelNetTrainer:
   - Precomputed backbone features (576-dim RGB only)
@@ -38,7 +38,7 @@ from typing import Optional, Dict, Tuple, List
 import numpy as np
 from tqdm import tqdm
 
-from models.vel_net_v2 import VelNetV2, GeometryLoss, DynamicsLoss, JointLoss
+from models.vel_net_v2 import VelNetV2, OmegaLoss, TranslationLoss, JointLoss
 from models.vel_net.visual_encoder import CompactEncoder
 
 try:
@@ -132,9 +132,9 @@ class VelNetV2Trainer:
 
         # Loss function
         if stage == 1:
-            self.loss_fn = GeometryLoss()
+            self.loss_fn = OmegaLoss()
         elif stage == 2:
-            self.loss_fn = DynamicsLoss()
+            self.loss_fn = TranslationLoss()
         elif stage == 3:
             self.loss_fn = JointLoss()
 
@@ -154,29 +154,42 @@ class VelNetV2Trainer:
     def _configure_stage(self, stage, lr, lr_geometry, lr_dynamics, weight_decay):
         """Configure model freezing and optimizer for the given stage."""
         if stage == 1:
+            # Stage A (Rotation): Train RotationNet only
+            self.model.freeze_geometry()  # TranslationBranch + FlowEncoder
             self.model.freeze_dynamics()
             self.model.freeze_fusion()
-            # Optimize: geometry + flow_encoder + RGB encoder FC
+            # Freeze encoder
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            # Optimize: RotationNet only
+            params = list(self.model.get_rotation_params())
+            self.optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+        elif stage == 2:
+            # Stage B (Translation): Train TranslationBranch + Dynamics + FlowEncoder + encoder
+            self.model.freeze_rotation()
+            # Unfreeze everything else
+            for param in self.model.geometry.parameters():
+                param.requires_grad = True
+            for param in self.model.flow_encoder.parameters():
+                param.requires_grad = True
+            for param in self.model.dynamics.parameters():
+                param.requires_grad = True
+            for param in self.encoder.parameters():
+                param.requires_grad = True
+            # Optimize
             params = (
                 list(self.model.get_geometry_params()) +
+                list(self.model.get_dynamics_params()) +
                 list(self.encoder.get_trainable_params())
             )
             self.optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
-        elif stage == 2:
-            self.model.freeze_geometry()
-            self.model.freeze_fusion()
-            # Freeze encoder — only dynamics is training
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            # Optimize: dynamics branch only
-            params = list(self.model.get_dynamics_params())
-            self.optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
-
         elif stage == 3:
+            # Stage C (Joint): Train all with differential LRs
             self.model.unfreeze_all()
-            # Differential LR: lower for pretrained branches
             param_groups = [
+                {'params': self.model.get_rotation_params(), 'lr': lr_geometry},
                 {'params': self.model.get_geometry_params(), 'lr': lr_geometry},
                 {'params': self.model.get_dynamics_params(), 'lr': lr_dynamics},
                 {'params': list(self.encoder.get_trainable_params()), 'lr': lr},
@@ -268,11 +281,12 @@ class VelNetV2Trainer:
 
         # But keep frozen parts in eval mode
         if self.stage == 1:
-            self.model.dynamics.eval()
-        elif self.stage == 2:
             self.model.geometry.eval()
+            self.model.dynamics.eval()
             self.model.flow_encoder.eval()
             self.encoder.eval()
+        elif self.stage == 2:
+            self.model.rotation_net.eval()
 
         tf_ratio = self.get_teacher_forcing_ratio()
         scaler = torch.cuda.amp.GradScaler()
@@ -300,7 +314,6 @@ class VelNetV2Trainer:
                     velocities_gt = batch['velocities_gt'][b_idx].to(self.device)
                     prev_vel_raw = batch['initial_prev_vels'][b_idx].to(self.device)
                     accel_aug = batch['accel_aug'][b_idx].to(self.device)
-                    gyro_aug = batch['gyro_aug'][b_idx].to(self.device)
                     angular_velocity_gt = batch['angular_velocity_gt'][b_idx].to(self.device)
                     direction_gt = batch['translation_direction_gt'][b_idx].to(self.device)
                     scale_gt = batch['translation_scale_gt'][b_idx].to(self.device)
@@ -319,50 +332,72 @@ class VelNetV2Trainer:
                     rgb_feat_all = self.encoder.forward_from_backbone_features(rgb_bb_all)  # (L, 32)
 
                     # Batch flow encoding: all frames at once
-                    # optical_flows has N-1 entries (flow from frame i to i+1)
-                    # For frame_indices[t], the flow is flows[frame_indices[t]-1]
-                    # (flow leading TO this frame from previous frame)
                     flow_indices = [max(0, fi - 1) for fi in frame_indices]
                     flow_idx_tensor = torch.tensor(flow_indices, device=self.device)
-                    flows_all = optical_flows[flow_idx_tensor]  # (L, 2, H, W)
-                    flow_feat_all = self.model.flow_encoder(flows_all)  # (L, 64)
+                    flows_all = optical_flows[flow_idx_tensor]  # (L, 2, H, W) — raw flows
+                    flow_feat_all = self.model.flow_encoder(flows_all)  # (L, 64) — pooled
 
-                    prev_scale = None  # For dynamics smoothness loss
+                    prev_scale = None  # For translation loss smoothness
+                    prev_omega_pred = None  # For omega temporal diff loss
+                    prev_omega_gt = None
 
                     for t in range(seq_length):
                         # Get features for this timestep
                         rgb_feat = rgb_feat_all[t:t+1]    # (1, 32)
                         flow_feat = flow_feat_all[t:t+1]  # (1, 64)
+                        flow_raw = flows_all[t:t+1]        # (1, 2, H, W)
                         imu_accel = accel_aug[t:t+1]       # (1, 3)
-                        imu_gyro = gyro_aug[t:t+1]         # (1, 3)
                         action = actions[t:t+1]             # (1, 4)
 
                         # Forward through model
                         out = self.model.encode_step(
                             rgb_feat=rgb_feat,
                             flow_feat=flow_feat,
+                            flow_raw=flow_raw,
                             imu_accel=imu_accel,
-                            imu_gyro=imu_gyro,
                             prev_vel=prev_vel_raw.unsqueeze(0),
                             action=action,
                         )
 
-                        # Compute loss
-                        gt = {
-                            'angular_velocity_gt': angular_velocity_gt[t:t+1],
-                            'translation_direction_gt': direction_gt[t:t+1],
-                            'translation_scale_gt': scale_gt[t:t+1],
-                            'confidence_gt': confidence_gt[t:t+1],
-                            'velocity_gt': velocities_gt[t:t+1],
-                        }
-
+                        # Compute loss based on stage
                         if self.stage == 1:
-                            loss_dict = self.loss_fn(out, gt)
+                            # Stage A: OmegaLoss only
+                            loss_dict = self.loss_fn(
+                                out['angular_velocity'],
+                                angular_velocity_gt[t:t+1],
+                                prev_omega_pred=prev_omega_pred,
+                                prev_omega_gt=prev_omega_gt,
+                            )
+                            prev_omega_pred = out['angular_velocity'].detach()
+                            prev_omega_gt = angular_velocity_gt[t:t+1].detach()
+
                         elif self.stage == 2:
+                            # Stage B: TranslationLoss
+                            gt = {
+                                'translation_direction_gt': direction_gt[t:t+1],
+                                'translation_scale_gt': scale_gt[t:t+1],
+                                'confidence_gt': confidence_gt[t:t+1],
+                                'velocity_gt': velocities_gt[t:t+1],
+                            }
                             loss_dict = self.loss_fn(out, gt, prev_scale=prev_scale)
                             prev_scale = out['translation_scale'].detach()
+
                         else:  # stage 3
-                            loss_dict = self.loss_fn(out, gt)
+                            # Stage C: JointLoss
+                            gt = {
+                                'angular_velocity_gt': angular_velocity_gt[t:t+1],
+                                'translation_direction_gt': direction_gt[t:t+1],
+                                'translation_scale_gt': scale_gt[t:t+1],
+                                'confidence_gt': confidence_gt[t:t+1],
+                                'velocity_gt': velocities_gt[t:t+1],
+                            }
+                            loss_dict = self.loss_fn(
+                                out, gt,
+                                prev_omega_pred=prev_omega_pred,
+                                prev_omega_gt=prev_omega_gt,
+                            )
+                            prev_omega_pred = out['angular_velocity'].detach()
+                            prev_omega_gt = angular_velocity_gt[t:t+1].detach()
 
                         batch_loss += loss_dict['loss']
                         batch_frames += 1
@@ -448,9 +483,7 @@ class VelNetV2Trainer:
                 actions = batch['actions'][b_idx].to(self.device)
                 velocities_gt = batch['velocities_gt'][b_idx].to(self.device)
                 prev_vel_raw = batch['initial_prev_vels'][b_idx].to(self.device)
-                # Validation uses clean data (accel_aug = accel_gt for val dataset)
                 accel = batch['accel_aug'][b_idx].to(self.device)
-                gyro = batch['gyro_aug'][b_idx].to(self.device)
                 angular_velocity_gt = batch['angular_velocity_gt'][b_idx].to(self.device)
                 direction_gt = batch['translation_direction_gt'][b_idx].to(self.device)
 
@@ -466,15 +499,15 @@ class VelNetV2Trainer:
 
                 flow_indices = [max(0, fi - 1) for fi in frame_indices]
                 flow_idx_tensor = torch.tensor(flow_indices, device=self.device)
-                flows_all = optical_flows[flow_idx_tensor]
-                flow_feat_all = self.model.flow_encoder(flows_all)
+                flows_all = optical_flows[flow_idx_tensor]  # (L, 2, H, W) raw
+                flow_feat_all = self.model.flow_encoder(flows_all)  # (L, 64) pooled
 
                 for t in range(seq_length):
                     out = self.model.encode_step(
                         rgb_feat=rgb_feat_all[t:t+1],
                         flow_feat=flow_feat_all[t:t+1],
+                        flow_raw=flows_all[t:t+1],
                         imu_accel=accel[t:t+1],
-                        imu_gyro=gyro[t:t+1],
                         prev_vel=prev_vel_raw.unsqueeze(0),
                         action=actions[t:t+1],
                     )
@@ -513,7 +546,7 @@ class VelNetV2Trainer:
 
     def train(self, n_epochs: int = 200, early_stop_patience: int = 30) -> Dict[str, List[float]]:
         """Main training loop."""
-        history = {'train_loss': [], 'val_vel_mae': [], 'tf_ratio': []}
+        history = {'train_loss': [], 'val_vel_mae': [], 'val_loss': [], 'tf_ratio': []}
 
         # Check precomputed data
         has_features, has_flows = self._check_precomputed_available()
@@ -528,7 +561,7 @@ class VelNetV2Trainer:
                 "Run: python training/vel_net_v2/precompute_optical_flow.py --data_dir <data_dir>"
             )
 
-        stage_name = {1: 'Geometry', 2: 'Dynamics', 3: 'Joint'}[self.stage]
+        stage_name = {1: 'Rotation', 2: 'Translation', 3: 'Joint'}[self.stage]
         print(f"\n{'='*60}")
         print(f"VelNetV2 Training — Stage {self.stage} ({stage_name})")
         print(f"{'='*60}")
@@ -566,6 +599,7 @@ class VelNetV2Trainer:
 
             history['train_loss'].append(train_metrics['train/loss'])
             history['val_vel_mae'].append(val_metrics['val/vel_mae'])
+            history['val_loss'].append(val_metrics['val/vel_mae'])
             history['tf_ratio'].append(tf_ratio)
 
             if self.use_wandb:

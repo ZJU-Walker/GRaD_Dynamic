@@ -320,7 +320,7 @@ def test_command(args):
     orientations_t = torch.from_numpy(orientations).to(device)
     velocities_body = transform_worldvel_to_bodyvel(velocities_world_t, orientations_t).cpu().numpy()
 
-    # Compute body-frame acceleration and gyro
+    # Compute body-frame acceleration
     accel_world = np.zeros_like(velocities_world)
     accel_world[1:] = (velocities_world[1:] - velocities_world[:-1]) / dt
     accel_world[0] = accel_world[1]
@@ -328,6 +328,7 @@ def test_command(args):
         torch.from_numpy(accel_world).to(device), orientations_t
     ).cpu().numpy()
 
+    # Angular velocity GT for comparison (not model input — RotationNet predicts from flow)
     omega_body = compute_angular_velocity_body(orientations, dt)
     omega_body_padded = np.zeros((len(orientations), 3), dtype=np.float32)
     omega_body_padded[1:] = omega_body
@@ -336,6 +337,8 @@ def test_command(args):
     # Auto-regressive test
     all_preds = []
     all_gts = []
+    all_omega_preds = []
+    all_omega_gts = []
     all_directions = []
     all_scales = []
     all_corrections = []
@@ -348,18 +351,17 @@ def test_command(args):
             rgb_feat = encoder.forward_from_backbone_features(rgb_backbone[t:t+1])
 
             flow_idx = max(0, t - 1)
-            flow = optical_flows[flow_idx:flow_idx+1]
-            flow_feat = model.flow_encoder(flow)
+            flow_raw = optical_flows[flow_idx:flow_idx+1]  # (1, 2, H, W)
+            flow_feat = model.flow_encoder(flow_raw)
 
             accel_t = torch.from_numpy(accel_body[t].astype(np.float32)).unsqueeze(0).to(device)
-            gyro_t = torch.from_numpy(omega_body_padded[t].astype(np.float32)).unsqueeze(0).to(device)
             action_t = torch.from_numpy(actions[t].astype(np.float32)).unsqueeze(0).to(device)
 
             out = model.encode_step(
                 rgb_feat=rgb_feat,
                 flow_feat=flow_feat,
+                flow_raw=flow_raw,
                 imu_accel=accel_t,
-                imu_gyro=gyro_t,
                 prev_vel=prev_vel.unsqueeze(0),
                 action=action_t,
             )
@@ -369,16 +371,21 @@ def test_command(args):
 
             all_preds.append(vel_pred.cpu().numpy())
             all_gts.append(velocities_body[t])
+            all_omega_preds.append(out['angular_velocity'].squeeze(0).cpu().numpy())
+            all_omega_gts.append(omega_body_padded[t])
             all_directions.append(out['translation_direction'].squeeze(0).cpu().numpy())
             all_scales.append(out['translation_scale'].squeeze(0).cpu().numpy())
             all_corrections.append(out['motion_correction'].squeeze(0).cpu().numpy())
 
     all_preds = np.array(all_preds)
     all_gts = np.array(all_gts)
+    all_omega_preds = np.array(all_omega_preds)  # (T, 3)
+    all_omega_gts = np.array(all_omega_gts)      # (T, 3)
     all_directions = np.array(all_directions)   # (T, 3)
     all_scales = np.array(all_scales)           # (T, 1)
     all_corrections = np.array(all_corrections) # (T, 3)
     errors = np.abs(all_preds - all_gts)
+    omega_errors = np.abs(all_omega_preds - all_omega_gts)
 
     metrics = {
         'mae': np.mean(errors),
@@ -386,12 +393,18 @@ def test_command(args):
         'mae_y': np.mean(errors[:, 1]),
         'mae_z': np.mean(errors[:, 2]),
         'rmse': np.sqrt(np.mean(errors**2)),
+        'omega_mae': np.mean(omega_errors),
+        'omega_mae_x': np.mean(omega_errors[:, 0]),
+        'omega_mae_y': np.mean(omega_errors[:, 1]),
+        'omega_mae_z': np.mean(omega_errors[:, 2]),
     }
 
     print(f"\nAuto-regressive Test (VelNetV2, {n_frames-1} steps):")
     print(f"  MAE: {metrics['mae']:.4f} m/s")
     print(f"  MAE (x,y,z): [{metrics['mae_x']:.4f}, {metrics['mae_y']:.4f}, {metrics['mae_z']:.4f}]")
     print(f"  RMSE: {metrics['rmse']:.4f} m/s")
+    print(f"  Omega MAE: {metrics['omega_mae']:.4f} rad/s")
+    print(f"  Omega MAE (x,y,z): [{metrics['omega_mae_x']:.4f}, {metrics['omega_mae_y']:.4f}, {metrics['omega_mae_z']:.4f}]")
 
     mean_correction = np.mean(all_corrections, axis=0)
     print(f"  Mean correction (Δv): [{mean_correction[0]:.4f}, {mean_correction[1]:.4f}, {mean_correction[2]:.4f}]")
@@ -558,6 +571,23 @@ def test_command(args):
         plt.savefig(decomp_path, dpi=150)
         plt.close()
         print(f"  Combined decomposition saved: {decomp_path}")
+
+        # Angular velocity plot
+        fig_omega, axes_omega = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
+        omega_labels = ['Omega X (roll)', 'Omega Y (pitch)', 'Omega Z (yaw)']
+        for i, label in enumerate(omega_labels):
+            axes_omega[i].plot(t_axis, all_omega_gts[:, i], 'b-', label='GT', linewidth=1.5)
+            axes_omega[i].plot(t_axis, all_omega_preds[:, i], 'r--', label='Pred', linewidth=1.5)
+            axes_omega[i].set_ylabel(f'{label} (rad/s)')
+            axes_omega[i].legend(loc='upper right')
+            axes_omega[i].grid(True, alpha=0.3)
+        axes_omega[0].set_title(f'Angular Velocity | MAE: {metrics["omega_mae"]:.4f} rad/s')
+        axes_omega[2].set_xlabel('Time (s)')
+        plt.tight_layout()
+        p = str(seq_path / 'vel_v2_angular_velocity.png')
+        plt.savefig(p, dpi=150)
+        plt.close()
+        print(f"  Plot saved: {p}")
 
 
 def eval_command(args):

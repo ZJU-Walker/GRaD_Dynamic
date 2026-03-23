@@ -35,6 +35,7 @@ from models.vel_net_v2 import VelNetV2
 from models.vel_net.visual_encoder import CompactEncoder
 from models.vel_net_body_legacy.vel_obs_utils_body import transform_worldvel_to_bodyvel
 from training.vel_net_body.dataset import IMUAugmentation
+from training.vel_net_v2.dataset_v2 import compute_angular_velocity_body
 
 
 # Reuse MAP_CONFIGS from legacy evaluator
@@ -180,6 +181,12 @@ def fly_and_evaluate_v2(
     timestamps = []
     trajectory_actual = []
     trajectory_desired = []
+    # Decomposition debug data
+    direction_list = []
+    scale_list = []
+    correction_list = []
+    accel_input_list = []
+    gyro_input_list = []
 
     dt = 1.0 / env.sim_freq
     total_time = sampler.total_time + 2.0
@@ -188,8 +195,9 @@ def fly_and_evaluate_v2(
     stabilize_steps = 50
 
     prev_vel_raw = torch.zeros(3, device=device)
-    prev_vel_gt = np.zeros(3)
+    prev_vel_gt_world = np.zeros(3)  # World frame for correct accel computation
     prev_rgb_tensor = None  # For optical flow computation
+    prev_quat_xyzw = None  # For computing gyro from quaternion finite differences
     model_dt = 1.0 / 30.0
 
     model.reset_hidden_state(batch_size=1)
@@ -275,28 +283,35 @@ def fly_and_evaluate_v2(
 
                 flow_feat = model.flow_encoder(flow)  # (1, 64)
 
-                # IMU
-                accel_gt = (vel_gt - prev_vel_gt) / model_dt
-                omega_imu = omega_gt.copy()
+                # IMU — compute acceleration in world frame first, then rotate to body
+                accel_world = (vel_gt_world - prev_vel_gt_world) / model_dt
+                accel_gt = transform_worldvel_to_bodyvel(
+                    torch.from_numpy(accel_world.astype(np.float32)).to(device),
+                    quat_t,
+                ).cpu().numpy()
+
+                # Gyro GT — compute from quaternion finite differences (for comparison only)
+                if prev_quat_xyzw is not None:
+                    quat_pair = np.stack([prev_quat_xyzw, quat_xyzw], axis=0)  # (2, 4)
+                    omega_imu = compute_angular_velocity_body(quat_pair, model_dt)[0]  # (3,)
+                else:
+                    omega_imu = np.zeros(3, dtype=np.float32)
 
                 if imu_noise and imu_aug is not None:
                     accel_aug = accel_gt * imu_scale_accel + imu_bias_accel
                     accel_aug += np.random.normal(0, imu_aug.noise_std, size=3)
-                    omega_aug = omega_imu * imu_scale_gyro + imu_bias_gyro
-                    omega_aug += np.random.normal(0, imu_aug.noise_std, size=3)
                     accel_tensor = torch.from_numpy(accel_aug.astype(np.float32)).unsqueeze(0).to(device)
-                    gyro_tensor = torch.from_numpy(omega_aug.astype(np.float32)).unsqueeze(0).to(device)
                 else:
                     accel_tensor = torch.from_numpy(accel_gt.astype(np.float32)).unsqueeze(0).to(device)
-                    gyro_tensor = torch.from_numpy(omega_imu.astype(np.float32)).unsqueeze(0).to(device)
 
                 action_tensor = torch.from_numpy(action.astype(np.float32)).unsqueeze(0).to(device)
 
+                # RotationNet predicts omega from flow — no gyro input needed
                 out = model.encode_step(
                     rgb_feat=rgb_feat,
                     flow_feat=flow_feat,
+                    flow_raw=flow,
                     imu_accel=accel_tensor,
-                    imu_gyro=gyro_tensor,
                     prev_vel=prev_vel_raw.unsqueeze(0),
                     action=action_tensor,
                 )
@@ -307,13 +322,21 @@ def fly_and_evaluate_v2(
                 prev_vel_raw = out['velocity'].squeeze(0).detach()
                 prev_rgb_tensor = rgb_tensor
 
+                # Decomposition debug
+                direction_list.append(out['translation_direction'].squeeze(0).cpu().numpy())
+                scale_list.append(out['translation_scale'].squeeze(0).cpu().numpy())
+                correction_list.append(out['motion_correction'].squeeze(0).cpu().numpy())
+                accel_input_list.append(accel_gt.copy())
+                gyro_input_list.append(omega_imu.copy())
+
             vel_gt_list.append(vel_gt.copy())
             vel_pred_list.append(vel_pred.copy())
             omega_gt_list.append(omega_gt.copy())
             omega_pred_list.append(omega_pred.copy())
             timestamps.append(t)
 
-        prev_vel_gt = vel_gt.copy()
+        prev_vel_gt_world = vel_gt_world.copy()
+        prev_quat_xyzw = quat_xyzw.copy()
 
         # Video frame
         if step % 2 == 0:
@@ -357,6 +380,11 @@ def fly_and_evaluate_v2(
     omega_gt_arr = np.array(omega_gt_list)
     omega_pred_arr = np.array(omega_pred_list)
     timestamps_arr = np.array(timestamps)
+    direction_arr = np.array(direction_list)   # (T, 3)
+    scale_arr = np.array(scale_list)           # (T, 1)
+    correction_arr = np.array(correction_list) # (T, 3)
+    accel_input_arr = np.array(accel_input_list)  # (T, 3)
+    gyro_input_arr = np.array(gyro_input_list)    # (T, 3)
 
     vel_errors = np.abs(vel_pred_arr - vel_gt_arr)
     omega_errors = np.abs(omega_pred_arr - omega_gt_arr)
@@ -378,6 +406,17 @@ def fly_and_evaluate_v2(
     print(f"  Vel MAE (x,y,z): [{metrics['mae_x']:.4f}, {metrics['mae_y']:.4f}, {metrics['mae_z']:.4f}]")
     print(f"  Vel RMSE: {metrics['rmse']:.4f} m/s")
     print(f"  Omega MAE: {metrics['omega_mae']:.4f} rad/s")
+
+    # Decomposition debug stats
+    geo_vel = direction_arr * scale_arr  # (T, 3)
+    geo_errors = np.abs(geo_vel - vel_gt_arr)
+    print(f"\n  --- Decomposition Debug ---")
+    print(f"  Direction mean:     [{np.mean(direction_arr[:,0]):.4f}, {np.mean(direction_arr[:,1]):.4f}, {np.mean(direction_arr[:,2]):.4f}]")
+    print(f"  Scale mean:         {np.mean(scale_arr):.4f}")
+    print(f"  Correction mean:    [{np.mean(correction_arr[:,0]):.4f}, {np.mean(correction_arr[:,1]):.4f}, {np.mean(correction_arr[:,2]):.4f}]")
+    print(f"  Geo vel MAE (x,y,z): [{np.mean(geo_errors[:,0]):.4f}, {np.mean(geo_errors[:,1]):.4f}, {np.mean(geo_errors[:,2]):.4f}]")
+    print(f"  Accel input mean:   [{np.mean(accel_input_arr[:,0]):.4f}, {np.mean(accel_input_arr[:,1]):.4f}, {np.mean(accel_input_arr[:,2]):.4f}]")
+    print(f"  Gyro input mean:    [{np.mean(gyro_input_arr[:,0]):.4f}, {np.mean(gyro_input_arr[:,1]):.4f}, {np.mean(gyro_input_arr[:,2]):.4f}]")
     print(f"{'='*60}\n")
 
     # Save outputs
@@ -401,6 +440,109 @@ def fly_and_evaluate_v2(
     save_velocity_plot(timestamps_arr, vel_gt_arr, vel_pred_arr, metrics, str(plot_path))
     print(f"Plot saved: {plot_path}")
 
+    # Decomposition plots
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    t_axis = timestamps_arr - timestamps_arr[0]
+
+    fig, axes = plt.subplots(5, 1, figsize=(14, 17.5), sharex=True)
+
+    # 1) Direction
+    for i, c in enumerate(['X', 'Y', 'Z']):
+        axes[0].plot(t_axis, direction_arr[:, i], label=f'd_{c}', linewidth=1.2)
+    axes[0].set_ylabel('Direction (unit)')
+    axes[0].set_title('Eval Decomposition | Direction (d)')
+    axes[0].legend(loc='upper right')
+    axes[0].grid(True, alpha=0.3)
+
+    # 2) Scale vs GT speed
+    axes[1].plot(t_axis, scale_arr[:, 0], 'k-', label='scale', linewidth=1.5)
+    gt_speed = np.linalg.norm(vel_gt_arr, axis=1)
+    axes[1].plot(t_axis, gt_speed, 'b--', label='GT speed', linewidth=1.0, alpha=0.7)
+    axes[1].set_ylabel('Scale (m/s)')
+    axes[1].set_title('Eval Decomposition | Scale (s) vs GT Speed')
+    axes[1].legend(loc='upper right')
+    axes[1].grid(True, alpha=0.3)
+
+    # 3) d*s geometric vel vs GT
+    for i, c in enumerate(['X', 'Y', 'Z']):
+        axes[2].plot(t_axis, geo_vel[:, i], label=f'd*s {c}', linewidth=1.2)
+        axes[2].plot(t_axis, vel_gt_arr[:, i], '--', alpha=0.5, linewidth=1.0)
+    axes[2].set_ylabel('d * s (m/s)')
+    axes[2].set_title('Eval Decomposition | d*s Geometric Vel vs GT')
+    axes[2].legend(loc='upper right')
+    axes[2].grid(True, alpha=0.3)
+
+    # 4) Correction Δv
+    for i, c in enumerate(['X', 'Y', 'Z']):
+        axes[3].plot(t_axis, correction_arr[:, i], label=f'Δv_{c}', linewidth=1.5)
+    axes[3].axhline(y=0, color='gray', linestyle=':', alpha=0.5)
+    axes[3].set_ylabel('Correction Δv (m/s)')
+    axes[3].set_title('Eval Decomposition | Correction Δv')
+    axes[3].legend(loc='upper right')
+    axes[3].grid(True, alpha=0.3)
+
+    # 5) Final vel vs GT per-axis
+    colors = ['r', 'g', 'b']
+    for i, c in enumerate(['X', 'Y', 'Z']):
+        axes[4].plot(t_axis, vel_gt_arr[:, i], color=colors[i], linestyle='-',
+                    label=f'GT {c}', linewidth=1.2, alpha=0.7)
+        axes[4].plot(t_axis, vel_pred_arr[:, i], color=colors[i], linestyle='--',
+                    label=f'Pred {c}', linewidth=1.2)
+    axes[4].set_ylabel('Velocity (m/s)')
+    axes[4].set_xlabel('Time (s)')
+    axes[4].set_title('Eval Decomposition | Final Velocity vs GT')
+    axes[4].legend(loc='upper right', ncol=2)
+    axes[4].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    decomp_path = output_dir / f'eval_v2_{waypoints_name}_decomposition.png'
+    plt.savefig(str(decomp_path), dpi=150)
+    plt.close()
+    print(f"Decomposition plot saved: {decomp_path}")
+
+    # 6) IMU inputs debug plot
+    fig2, axes2 = plt.subplots(2, 1, figsize=(14, 7), sharex=True)
+    for i, c in enumerate(['X', 'Y', 'Z']):
+        axes2[0].plot(t_axis, accel_input_arr[:, i], label=f'accel_{c}', linewidth=1.0)
+    axes2[0].set_ylabel('Accel (m/s²)')
+    axes2[0].set_title('Eval IMU Inputs | Acceleration (body frame)')
+    axes2[0].legend(loc='upper right')
+    axes2[0].grid(True, alpha=0.3)
+
+    for i, c in enumerate(['X', 'Y', 'Z']):
+        axes2[1].plot(t_axis, gyro_input_arr[:, i], label=f'gyro_{c}', linewidth=1.0)
+    axes2[1].set_ylabel('Gyro (rad/s)')
+    axes2[1].set_xlabel('Time (s)')
+    axes2[1].set_title('Eval IMU Inputs | Gyroscope (body frame)')
+    axes2[1].legend(loc='upper right')
+    axes2[1].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    imu_path = output_dir / f'eval_v2_{waypoints_name}_imu_inputs.png'
+    plt.savefig(str(imu_path), dpi=150)
+    plt.close()
+    print(f"IMU inputs plot saved: {imu_path}")
+
+    # Angular velocity plot
+    fig3, axes3 = plt.subplots(3, 1, figsize=(14, 8), sharex=True)
+    omega_labels = ['Omega X (roll)', 'Omega Y (pitch)', 'Omega Z (yaw)']
+    for i, label in enumerate(omega_labels):
+        axes3[i].plot(t_axis, omega_gt_arr[:, i], 'b-', label='GT', linewidth=1.5)
+        axes3[i].plot(t_axis, omega_pred_arr[:, i], 'r--', label='Pred', linewidth=1.5)
+        axes3[i].set_ylabel(f'{label} (rad/s)')
+        axes3[i].legend(loc='upper right')
+        axes3[i].grid(True, alpha=0.3)
+    axes3[0].set_title(f'Angular Velocity | MAE: {metrics["omega_mae"]:.4f} rad/s')
+    axes3[2].set_xlabel('Time (s)')
+    plt.tight_layout()
+    omega_path = output_dir / f'eval_v2_{waypoints_name}_angular_velocity.png'
+    plt.savefig(str(omega_path), dpi=150)
+    plt.close()
+    print(f"Angular velocity plot saved: {omega_path}")
+
     np.savez(
         output_dir / f'eval_v2_{waypoints_name}_v{v_avg}_data.npz',
         timestamps=timestamps_arr,
@@ -408,6 +550,11 @@ def fly_and_evaluate_v2(
         omega_gt=omega_gt_arr, omega_pred=omega_pred_arr,
         trajectory_actual=np.array(trajectory_actual),
         trajectory_desired=np.array(trajectory_desired),
+        directions=direction_arr,
+        scales=scale_arr,
+        corrections=correction_arr,
+        accel_inputs=accel_input_arr,
+        gyro_inputs=gyro_input_arr,
         metrics=metrics,
     )
 

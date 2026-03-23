@@ -1,11 +1,15 @@
-# VelNetV2 — Unified 3-Stage Training Config
+# VelNetV2 — Unified 3-Stage Training Config (Flow-Based Rotation)
 # Run all stages with one command:
 #   python training/vel_net_v2/train_vel_net_v2.py train_all \
 #       --config training/vel_net_v2/configs/train_all.yaml
+#
+# Stage 1 (Rotation):    Train RotationNet only (omega from flow)
+# Stage 2 (Translation): Train TranslationBranch + Dynamics + FlowEncoder
+# Stage 3 (Joint):       Fine-tune all with differential LR
 
 # Shared across all stages
 data_dir: /scr/irislab/ke/data/vel_net_v2_data_0309/gate_mid
-checkpoint_dir: checkpoints/vel_net/vel_net_v2_0309_1
+checkpoint_dir: checkpoints/vel_net/vel_net_v2_rotation_0316
 device: cuda:0
 wandb: true
 wandb_project: vel_net_v2
@@ -34,23 +38,23 @@ training_defaults:
 
 # Per-stage overrides
 stages:
-  1:
-    epochs: 100
-    lr: 3.0e-4
-    tf_start_epoch: 2
-    tf_end_epoch: 50
-    early_stop_patience: 70
-  2:
+  1:  # Rotation: RotationNet only (~13k params, converges fast)
     epochs: 30
+    lr: 1.0e-3              # higher LR ok — only 13k params
+    tf_start_epoch: 0        # tf irrelevant for Stage 1 (RotationNet doesn't use prev_vel)
+    tf_end_epoch: 25
+    early_stop_patience: 35
+  2:  # Translation: TranslationBranch + Dynamics + FlowEncoder (~498k params)
+    epochs: 50               # more epochs — training 498k params together
     lr: 3.0e-4
     tf_start_epoch: 5
-    tf_end_epoch: 25
-    early_stop_patience: 30
-  3:
-    epochs: 100
+    tf_end_epoch: 35
+    early_stop_patience: 35
+  3:  # Joint: all with differential LR
+    epochs: 30
     lr: 1.0e-4
-    lr_geometry: 3.0e-5
+    lr_geometry: 3.0e-5   # covers RotationNet + TranslationBranch + FlowEncoder
     lr_dynamics: 3.0e-5
     tf_start_epoch: 0
-    tf_end_epoch: 20
+    tf_end_epoch: 20          # gentler decay — fully autoregressive by epoch 30
     early_stop_patience: 25

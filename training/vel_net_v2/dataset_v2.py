@@ -116,7 +116,7 @@ class VelNetV2Dataset(Dataset):
       - velocities_gt: (L, 3) body frame GT velocity
       - initial_prev_vel: (3,) body frame prev_vel for first frame
       - accel_gt / accel_aug: (L, 3) body frame accelerometer
-      - gyro_gt / gyro_aug: (L, 3) body frame gyroscope
+      - gyro_gt: (L, 3) body frame angular velocity GT (for loss, not model input)
       - actions: (L, 4) [roll_rate, pitch_rate, yaw_rate, thrust]
       - angular_velocity_gt: (L, 3) body frame angular velocity
       - translation_direction_gt: (L, 3) = vel_body / ||vel_body||
@@ -148,9 +148,8 @@ class VelNetV2Dataset(Dataset):
         self.dt = dt
         self.min_vel_threshold = min_vel_threshold
 
-        # IMU augmentation (separate instances for accel and gyro)
+        # IMU augmentation (accel only — gyro replaced by RotationNet)
         self.accel_aug = IMUAugmentation(enabled=imu_augmentation)
-        self.gyro_aug = IMUAugmentation(enabled=imu_augmentation)
 
         # Find all sequences
         self.sequence_dirs = sorted(glob.glob(str(self.data_dir / "seq_*")))
@@ -257,14 +256,10 @@ class VelNetV2Dataset(Dataset):
         accel_aug = self.accel_aug(accel_gt)
 
         # =====================================================================
-        # Gyroscope (body frame angular velocity)
+        # Angular velocity GT (body frame)
+        # Gyro augmentation removed — RotationNet predicts omega from flow
         # =====================================================================
         gyro_gt = seq['angular_velocity_body'][start:end].copy()
-        gyro_aug = self.gyro_aug(gyro_gt)
-
-        # =====================================================================
-        # Angular velocity GT (body frame)
-        # =====================================================================
         angular_velocity_gt = torch.from_numpy(gyro_gt.astype(np.float32))
 
         # =====================================================================
@@ -300,9 +295,8 @@ class VelNetV2Dataset(Dataset):
             # Acceleration (body frame)
             'accel_gt': torch.from_numpy(accel_gt.astype(np.float32)),
             'accel_aug': torch.from_numpy(accel_aug),
-            # Gyroscope (body frame)
+            # Angular velocity GT (body frame, for loss computation)
             'gyro_gt': torch.from_numpy(gyro_gt.astype(np.float32)),
-            'gyro_aug': torch.from_numpy(gyro_aug),
             # Geometry GT
             'angular_velocity_gt': angular_velocity_gt,
             'translation_direction_gt': torch.from_numpy(direction_gt.astype(np.float32)),
@@ -326,9 +320,8 @@ def collate_sequences_v2(batch: List[dict]) -> Dict[str, any]:
         # Acceleration
         'accel_gt': [b['accel_gt'] for b in batch],
         'accel_aug': [b['accel_aug'] for b in batch],
-        # Gyroscope
+        # Angular velocity GT
         'gyro_gt': [b['gyro_gt'] for b in batch],
-        'gyro_aug': [b['gyro_aug'] for b in batch],
         # Geometry GT
         'angular_velocity_gt': [b['angular_velocity_gt'] for b in batch],
         'translation_direction_gt': [b['translation_direction_gt'] for b in batch],
