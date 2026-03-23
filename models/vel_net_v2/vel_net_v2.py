@@ -1,15 +1,16 @@
 """
-VelNetV2: Composite model wrapping Geometry, Dynamics, and Fusion branches.
+VelNetV2: Composite model wrapping RotationNet, TranslationBranch, Dynamics, and Fusion.
 
 Multi-branch architecture for velocity estimation:
-  - Geometry Branch: angular velocity + translation direction (RGB + flow + IMU)
-  - Dynamics Branch: metric scale + correction (geometry outputs + IMU + actions)
-  - Fusion Head: direction * scale + correction → final velocity
+  - RotationNet: angular velocity from optical flow spatial structure (new)
+  - GeometryBranch (TranslationBranch): translation direction (RGB + flow + IMU + omega)
+  - DynamicsBranch: metric scale + correction (geometry outputs + IMU + actions)
+  - FusionHead: direction * scale + correction → final velocity
 
 No Rot6D input — orientation-agnostic for real deployment.
 RGB only — no depth features.
 Dense optical flow via RAFT-Small (precomputed, encoded by trainable FlowEncoder).
-Full IMU (accel + gyro) in body frame.
+Full IMU accel in body frame. Gyro replaced by RotationNet predictions.
 """
 
 import contextlib
@@ -20,6 +21,7 @@ from typing import Dict, Optional, Tuple
 from pathlib import Path
 
 from models.vel_net_v2.flow_encoder import FlowEncoder
+from models.vel_net_v2.rotation_net import RotationNet
 from models.vel_net_v2.geometry_branch import GeometryBranch
 from models.vel_net_v2.dynamics_branch import DynamicsBranch
 from models.vel_net_v2.fusion_head import FusionHead
@@ -29,7 +31,12 @@ class VelNetV2(nn.Module):
     """
     Composite velocity estimation network.
 
-    Manages three branches + flow encoder with support for staged training.
+    Manages RotationNet + three branches + flow encoder with support for staged training.
+
+    Stages:
+      1 (Rotation):    Train RotationNet only
+      2 (Translation): Train TranslationBranch + Dynamics + FlowEncoder
+      3 (Joint):       Train all
 
     Args:
         rgb_feat_dim: RGB feature dimension from CompactEncoder (default: 32)
@@ -57,7 +64,10 @@ class VelNetV2(nn.Module):
         # Flow encoder: (B, 2, H, W) → (B, flow_feat_dim)
         self.flow_encoder = FlowEncoder(flow_dim=flow_feat_dim)
 
-        # Geometry branch: angular velocity + translation direction
+        # RotationNet: (B, 2, H, W) → (B, 3) angular velocity
+        self.rotation_net = RotationNet()
+
+        # Geometry branch (TranslationBranch): direction + confidence
         self.geometry = GeometryBranch(
             rgb_feat_dim=rgb_feat_dim,
             flow_feat_dim=flow_feat_dim,
@@ -88,7 +98,8 @@ class VelNetV2(nn.Module):
         }
 
     def reset_hidden_state(self, batch_size: int = 1):
-        """Reset GRU hidden states for both branches."""
+        """Reset GRU hidden states for all branches."""
+        self.rotation_net.reset_hidden_state(batch_size)
         self.geometry.reset_hidden_state(batch_size)
         self.dynamics.reset_hidden_state(batch_size)
 
@@ -96,8 +107,8 @@ class VelNetV2(nn.Module):
         self,
         rgb_feat: torch.Tensor,
         flow_feat: torch.Tensor,
+        flow_raw: torch.Tensor,
         imu_accel: torch.Tensor,
-        imu_gyro: torch.Tensor,
         prev_vel: torch.Tensor,
         action: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
@@ -107,44 +118,58 @@ class VelNetV2(nn.Module):
         Args:
             rgb_feat: (B, 32) RGB features from CompactEncoder FC
             flow_feat: (B, 64) flow features from FlowEncoder
+            flow_raw: (B, 2, H, W) raw optical flow for RotationNet
             imu_accel: (B, 3) body-frame accelerometer
-            imu_gyro: (B, 3) body-frame gyroscope
             prev_vel: (B, 3) previous velocity estimate
             action: (B, 4) [roll_rate, pitch_rate, yaw_rate, thrust]
 
         Returns:
             Dict with velocity (B,3), angular_velocity (B,3), and intermediate outputs
         """
-        # Geometry branch
-        # Stage 2: geometry is frozen — no_grad prevents hidden-state graph accumulation
-        geo_ctx = torch.no_grad() if self.stage == 2 else contextlib.nullcontext()
+        # 1. RotationNet: predict omega from raw flow
+        # Stage 2: rotation is frozen
+        rot_ctx = torch.no_grad() if self.stage == 2 else contextlib.nullcontext()
+        with rot_ctx:
+            omega = self.rotation_net(flow_raw)  # (B, 3)
+
+        # Detach omega for downstream in staged training
+        if self.stage in (1, 2):
+            omega_for_geo = omega.detach()
+        else:
+            omega_for_geo = omega
+
+        # 2. TranslationBranch (GeometryBranch): predict direction + confidence
+        # Stage 1: geometry is frozen
+        geo_ctx = torch.no_grad() if self.stage == 1 else contextlib.nullcontext()
         with geo_ctx:
-            geo_out = self.geometry.forward_step(rgb_feat, flow_feat, imu_accel, imu_gyro, prev_vel)
+            geo_out = self.geometry.forward_step(
+                rgb_feat, flow_feat, imu_accel, omega_for_geo, prev_vel
+            )
 
         # Detach geometry outputs for dynamics input in staged training
-        # Stage 1: dynamics is frozen, no gradient flow needed through it
-        # Stage 2: geometry is frozen, prevent backward through it from dynamics
-        if self.stage in (1, 2):
+        if self.stage == 1:
             geo_for_dyn = {k: v.detach() for k, v in geo_out.items()}
         else:
             geo_for_dyn = geo_out
 
-        # Dynamics branch
-        # Stage 1: dynamics is frozen — no_grad prevents hidden-state graph accumulation
+        # Detach omega for dynamics in stage 1 (frozen)
+        omega_for_dyn = omega.detach() if self.stage == 1 else omega
+
+        # 3. DynamicsBranch: predict scale + correction (no gyro input)
+        # Stage 1: dynamics is frozen
         dyn_ctx = torch.no_grad() if self.stage == 1 else contextlib.nullcontext()
         with dyn_ctx:
             dyn_out = self.dynamics.forward_step(
                 translation_direction=geo_for_dyn['translation_direction'],
-                angular_velocity=geo_for_dyn['angular_velocity'],
+                angular_velocity=omega_for_dyn,
                 confidence=geo_for_dyn['confidence'],
                 imu_accel=imu_accel,
-                imu_gyro=imu_gyro,
                 prev_vel=prev_vel,
                 action=action,
             )
 
-        # Fusion
-        fused = self.fusion(geo_out, dyn_out)
+        # 4. Fusion (omega from RotationNet, not geometry branch)
+        fused = self.fusion(geo_out, dyn_out, omega)
 
         return fused
 
@@ -152,8 +177,8 @@ class VelNetV2(nn.Module):
         self,
         rgb_feats_seq: torch.Tensor,
         flow_feats_seq: torch.Tensor,
+        flow_raw_seq: torch.Tensor,
         imu_accel_seq: torch.Tensor,
-        imu_gyro_seq: torch.Tensor,
         prev_vel_init: torch.Tensor,
         actions_seq: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
@@ -163,8 +188,8 @@ class VelNetV2(nn.Module):
         Args:
             rgb_feats_seq: (B, T, 32) RGB features per timestep
             flow_feats_seq: (B, T, 64) flow features per timestep
+            flow_raw_seq: (B, T, 2, H, W) raw optical flow per timestep
             imu_accel_seq: (B, T, 3) body-frame accelerometer
-            imu_gyro_seq: (B, T, 3) body-frame gyroscope
             prev_vel_init: (B, 3) initial velocity estimate
             actions_seq: (B, T, 4) actions per timestep
 
@@ -190,8 +215,8 @@ class VelNetV2(nn.Module):
             out = self.encode_step(
                 rgb_feat=rgb_feats_seq[:, t],
                 flow_feat=flow_feats_seq[:, t],
+                flow_raw=flow_raw_seq[:, t],
                 imu_accel=imu_accel_seq[:, t],
-                imu_gyro=imu_gyro_seq[:, t],
                 prev_vel=prev_vel,
                 action=actions_seq[:, t],
             )
@@ -222,8 +247,14 @@ class VelNetV2(nn.Module):
     # Staged training utilities
     # =========================================================================
 
+    def freeze_rotation(self):
+        """Freeze RotationNet for Stage 2 training."""
+        for param in self.rotation_net.parameters():
+            param.requires_grad = False
+        self.rotation_net.eval()
+
     def freeze_geometry(self):
-        """Freeze geometry branch + flow encoder for Stage 2 training."""
+        """Freeze geometry branch (TranslationBranch) + flow encoder for Stage 1."""
         for param in self.geometry.parameters():
             param.requires_grad = False
         for param in self.flow_encoder.parameters():
@@ -247,8 +278,12 @@ class VelNetV2(nn.Module):
         for param in self.parameters():
             param.requires_grad = True
 
+    def get_rotation_params(self):
+        """Get RotationNet trainable parameters."""
+        return [p for p in self.rotation_net.parameters() if p.requires_grad]
+
     def get_geometry_params(self):
-        """Get geometry branch + flow encoder trainable parameters."""
+        """Get geometry branch (TranslationBranch) + flow encoder trainable parameters."""
         params = list(self.geometry.parameters()) + list(self.flow_encoder.parameters())
         return [p for p in params if p.requires_grad]
 

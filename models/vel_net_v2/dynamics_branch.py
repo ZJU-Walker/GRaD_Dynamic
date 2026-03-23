@@ -1,19 +1,21 @@
 """
 Dynamics Branch: Recover metric velocity scale using temporal history + control inputs.
 
-Takes geometry branch outputs + IMU + actions to estimate the scalar speed
+Takes geometry branch outputs + IMU accel + actions to estimate the scalar speed
 and a small velocity correction vector.
+
+Gyro input has been removed — angular velocity comes from RotationNet via
+the geometry branch outputs.
 
 Input (per timestep):
   - translation_direction: (B, 3) from geometry branch
-  - angular_velocity: (B, 3) from geometry branch
+  - angular_velocity: (B, 3) from RotationNet
   - confidence: (B, 1) from geometry branch
   - imu_accel: (B, 3) body frame accelerometer
-  - imu_gyro: (B, 3) body frame gyroscope
   - prev_vel: (B, 3) previous velocity estimate
   - action: (B, 4) [roll_rate, pitch_rate, yaw_rate, thrust]
 
-Per-step obs: [dir(3) + omega(3) + conf(1) + accel(3) + gyro(3) + prev_vel(3) + action(4)] = 20 dims
+Per-step obs: [dir(3) + omega(3) + conf(1) + accel(3) + prev_vel(3) + action(4)] = 17 dims
 
 Output:
   - translation_scale: (B, 1) positive scalar
@@ -31,8 +33,8 @@ class DynamicsBranch(nn.Module):
     Recover metric velocity scale using physics cues and control history.
 
     Architecture:
-      - InputNorm: LayerNorm(20)
-      - Projector MLP: 20 → 128 → 128
+      - InputNorm: LayerNorm(17)
+      - Projector MLP: 17 → 128 → 128
       - GRU: 2 layers, hidden_dim=128
       - Scale head: MLP 128→64→1 + softplus (positive scale)
       - Correction head: MLP 128→64→3 (residual velocity correction)
@@ -42,7 +44,7 @@ class DynamicsBranch(nn.Module):
         gru_layers: Number of GRU layers (default: 2)
     """
 
-    OBS_DIM = 20  # dir(3) + omega(3) + conf(1) + accel(3) + gyro(3) + prev_vel(3) + action(4)
+    OBS_DIM = 17  # dir(3) + omega(3) + conf(1) + accel(3) + prev_vel(3) + action(4)
 
     def __init__(
         self,
@@ -54,7 +56,7 @@ class DynamicsBranch(nn.Module):
         self.hidden_dim = hidden_dim
         self.gru_layers = gru_layers
 
-        input_dim = 20  # 3+3+1+3+3+3+4
+        input_dim = 17  # 3+3+1+3+3+4
 
         # Input normalization
         self.input_norm = nn.LayerNorm(input_dim)
@@ -105,7 +107,6 @@ class DynamicsBranch(nn.Module):
         angular_velocity: torch.Tensor,
         confidence: torch.Tensor,
         imu_accel: torch.Tensor,
-        imu_gyro: torch.Tensor,
         prev_vel: torch.Tensor,
         action: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
@@ -114,10 +115,9 @@ class DynamicsBranch(nn.Module):
 
         Args:
             translation_direction: (B, 3) unit vector from geometry branch
-            angular_velocity: (B, 3) from geometry branch
+            angular_velocity: (B, 3) from RotationNet
             confidence: (B, 1) from geometry branch
             imu_accel: (B, 3) body frame accelerometer
-            imu_gyro: (B, 3) body frame gyroscope
             prev_vel: (B, 3) previous velocity estimate
             action: (B, 4) [roll_rate, pitch_rate, yaw_rate, thrust]
 
@@ -134,16 +134,15 @@ class DynamicsBranch(nn.Module):
         if self._hidden_state.size(1) != B:
             self.reset_hidden_state(B)
 
-        # Concatenate inputs
+        # Concatenate inputs (no imu_gyro — omega comes from RotationNet)
         obs = torch.cat([
             translation_direction,  # 3
             angular_velocity,       # 3
             confidence,             # 1
             imu_accel,              # 3
-            imu_gyro,               # 3
             prev_vel,               # 3
             action,                 # 4
-        ], dim=1)  # (B, 20)
+        ], dim=1)  # (B, 17)
 
         # Normalize + project
         obs_norm = self.input_norm(obs)

@@ -1,95 +1,94 @@
 """
 Stage-specific loss functions for vel_net_v2 multi-stage training.
 
-Stage 1 (Geometry): angular velocity + translation direction + confidence
-Stage 2 (Dynamics): scale + velocity reconstruction + temporal smoothness
-Stage 3 (Joint): full velocity + angular velocity + regularization
+Stage 1 (Rotation):    OmegaLoss on RotationNet predictions
+Stage 2 (Translation): direction + confidence + scale + velocity
+Stage 3 (Joint):       OmegaLoss + velocity SmoothL1 + regularization
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict
+from typing import Dict, Optional
 
 
-class GeometryLoss(nn.Module):
+class OmegaLoss(nn.Module):
     """
-    Stage 1 loss for geometry branch training.
+    Robust angular velocity loss with temporal consistency.
 
     Components:
-      - angular_velocity_loss: MSE(pred_omega, gt_omega)
-      - direction_loss: 1 - cosine_similarity(pred_dir, gt_dir)
-      - confidence_loss: BCE(pred_conf, gt_conf)
+      - Pointwise: SmoothL1(omega_pred, omega_gt)
+      - Temporal difference: SmoothL1(delta_pred, delta_gt)
+
+    The temporal difference term preserves sharp transitions (e.g., sudden
+    rotation changes) that pointwise-only losses would smooth out.
+
+    Can be called per-timestep with optional prev_omega arguments for
+    temporal difference computation.
 
     Args:
-        omega_weight: Weight for angular velocity loss (default: 1.0)
-        direction_weight: Weight for direction loss (default: 1.0)
-        confidence_weight: Weight for confidence loss (default: 0.5)
+        delta_weight: Weight for temporal difference loss (default: 0.3)
     """
 
-    def __init__(
-        self,
-        omega_weight: float = 1.0,
-        direction_weight: float = 1.0,
-        confidence_weight: float = 0.5,
-    ):
-        super(GeometryLoss, self).__init__()
-        self.omega_weight = omega_weight
-        self.direction_weight = direction_weight
-        self.confidence_weight = confidence_weight
+    def __init__(self, delta_weight: float = 0.3):
+        super(OmegaLoss, self).__init__()
+        self.delta_weight = delta_weight
 
     def forward(
         self,
-        pred: Dict[str, torch.Tensor],
-        gt: Dict[str, torch.Tensor],
+        omega_pred: torch.Tensor,
+        omega_gt: torch.Tensor,
+        prev_omega_pred: Optional[torch.Tensor] = None,
+        prev_omega_gt: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute geometry stage loss.
+        Compute omega loss (per-timestep).
 
         Args:
-            pred: Dict with angular_velocity (B,3), translation_direction (B,3), confidence (B,1)
-            gt: Dict with angular_velocity_gt (B,3), translation_direction_gt (B,3), confidence_gt (B,1)
+            omega_pred: (B, 3) predicted angular velocity
+            omega_gt: (B, 3) ground truth angular velocity
+            prev_omega_pred: (B, 3) previous timestep prediction (optional)
+            prev_omega_gt: (B, 3) previous timestep GT (optional)
 
         Returns:
-            Dict with total loss and individual components
+            Dict with total loss and components
         """
-        # Angular velocity MSE
-        omega_loss = F.mse_loss(pred['angular_velocity'], gt['angular_velocity_gt'])
+        # Pointwise robust loss
+        L_point = F.smooth_l1_loss(omega_pred, omega_gt)
 
-        # Direction cosine loss: 1 - cos_sim
-        cos_sim = F.cosine_similarity(pred['translation_direction'], gt['translation_direction_gt'], dim=-1)
-        direction_loss = (1.0 - cos_sim).mean()
+        # Temporal difference loss
+        L_delta = torch.tensor(0.0, device=omega_pred.device)
+        if prev_omega_pred is not None and prev_omega_gt is not None:
+            delta_pred = omega_pred - prev_omega_pred
+            delta_gt = omega_gt - prev_omega_gt
+            L_delta = F.smooth_l1_loss(delta_pred, delta_gt)
 
-        # Confidence BCE (disable autocast — BCE is registered as unsafe)
-        with torch.cuda.amp.autocast(enabled=False):
-            confidence_loss = F.binary_cross_entropy(
-                pred['confidence'].float(), gt['confidence_gt'].float()
-            )
-
-        total = (
-            self.omega_weight * omega_loss +
-            self.direction_weight * direction_loss +
-            self.confidence_weight * confidence_loss
-        )
+        total = L_point + self.delta_weight * L_delta
 
         return {
             'loss': total,
-            'omega_loss': omega_loss,
-            'direction_loss': direction_loss,
-            'confidence_loss': confidence_loss,
+            'omega_point_loss': L_point,
+            'omega_delta_loss': L_delta,
         }
 
 
-class DynamicsLoss(nn.Module):
+class TranslationLoss(nn.Module):
     """
-    Stage 2 loss for dynamics branch training.
+    Stage 2 loss for translation branch + dynamics training.
+
+    Combines direction/confidence losses (from TranslationBranch) with
+    scale/velocity losses (from DynamicsBranch).
 
     Components:
+      - direction_loss: 1 - cosine_similarity(pred_dir, gt_dir)
+      - confidence_loss: BCE(pred_conf, gt_conf)
       - scale_loss: MSE(pred_scale, gt_speed)
       - velocity_loss: MSE(dir*scale + correction, gt_vel)
       - temporal_smoothness: penalize scale jumps
 
     Args:
+        direction_weight: Weight for direction loss (default: 1.0)
+        confidence_weight: Weight for confidence loss (default: 0.5)
         scale_weight: Weight for scale loss (default: 1.0)
         velocity_weight: Weight for velocity reconstruction loss (default: 2.0)
         smoothness_weight: Weight for temporal smoothness (default: 0.1)
@@ -97,11 +96,15 @@ class DynamicsLoss(nn.Module):
 
     def __init__(
         self,
+        direction_weight: float = 1.0,
+        confidence_weight: float = 0.5,
         scale_weight: float = 1.0,
         velocity_weight: float = 2.0,
         smoothness_weight: float = 0.1,
     ):
-        super(DynamicsLoss, self).__init__()
+        super(TranslationLoss, self).__init__()
+        self.direction_weight = direction_weight
+        self.confidence_weight = confidence_weight
         self.scale_weight = scale_weight
         self.velocity_weight = velocity_weight
         self.smoothness_weight = smoothness_weight
@@ -110,19 +113,33 @@ class DynamicsLoss(nn.Module):
         self,
         pred: Dict[str, torch.Tensor],
         gt: Dict[str, torch.Tensor],
-        prev_scale: torch.Tensor = None,
+        prev_scale: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute dynamics stage loss.
+        Compute translation + dynamics loss.
 
         Args:
-            pred: Dict with velocity (B,3), translation_scale (B,1), motion_correction (B,3)
-            gt: Dict with velocity_gt (B,3), translation_scale_gt (B,1)
-            prev_scale: Previous timestep's predicted scale (B,1) for smoothness
+            pred: Dict with translation_direction (B,3), confidence (B,1),
+                  velocity (B,3), translation_scale (B,1)
+            gt: Dict with translation_direction_gt (B,3), confidence_gt (B,1),
+                velocity_gt (B,3), translation_scale_gt (B,1)
+            prev_scale: Previous timestep's predicted scale (B,1)
 
         Returns:
             Dict with total loss and individual components
         """
+        # Direction cosine loss
+        cos_sim = F.cosine_similarity(
+            pred['translation_direction'], gt['translation_direction_gt'], dim=-1
+        )
+        direction_loss = (1.0 - cos_sim).mean()
+
+        # Confidence BCE
+        with torch.cuda.amp.autocast(enabled=False):
+            confidence_loss = F.binary_cross_entropy(
+                pred['confidence'].float(), gt['confidence_gt'].float()
+            )
+
         # Scale MSE
         scale_loss = F.mse_loss(pred['translation_scale'], gt['translation_scale_gt'])
 
@@ -135,6 +152,8 @@ class DynamicsLoss(nn.Module):
             smoothness_loss = F.mse_loss(pred['translation_scale'], prev_scale)
 
         total = (
+            self.direction_weight * direction_loss +
+            self.confidence_weight * confidence_loss +
             self.scale_weight * scale_loss +
             self.velocity_weight * velocity_loss +
             self.smoothness_weight * smoothness_loss
@@ -142,6 +161,8 @@ class DynamicsLoss(nn.Module):
 
         return {
             'loss': total,
+            'direction_loss': direction_loss,
+            'confidence_loss': confidence_loss,
             'scale_loss': scale_loss,
             'velocity_loss': velocity_loss,
             'smoothness_loss': smoothness_loss,
@@ -154,7 +175,7 @@ class JointLoss(nn.Module):
 
     Components:
       - velocity_loss: SmoothL1(pred_vel, gt_vel) — primary metric
-      - angular_velocity_loss: MSE(pred_omega, gt_omega)
+      - omega_loss: OmegaLoss (SmoothL1 + temporal diff)
       - geometry_reg: direction cosine + confidence (keep geometry reasonable)
       - scale_reg: keep scale reasonable
 
@@ -177,11 +198,14 @@ class JointLoss(nn.Module):
         self.omega_weight = omega_weight
         self.geometry_reg_weight = geometry_reg_weight
         self.scale_reg_weight = scale_reg_weight
+        self.omega_loss_fn = OmegaLoss()
 
     def forward(
         self,
         pred: Dict[str, torch.Tensor],
         gt: Dict[str, torch.Tensor],
+        prev_omega_pred: Optional[torch.Tensor] = None,
+        prev_omega_gt: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute joint stage loss.
@@ -191,6 +215,8 @@ class JointLoss(nn.Module):
                   translation_direction (B,3), translation_scale (B,1), confidence (B,1)
             gt: Dict with velocity_gt (B,3), angular_velocity_gt (B,3),
                 translation_direction_gt (B,3), translation_scale_gt (B,1), confidence_gt (B,1)
+            prev_omega_pred: (B, 3) previous timestep omega prediction (optional)
+            prev_omega_gt: (B, 3) previous timestep omega GT (optional)
 
         Returns:
             Dict with total loss and individual components
@@ -198,8 +224,13 @@ class JointLoss(nn.Module):
         # Primary velocity loss (SmoothL1 for robustness)
         velocity_loss = F.smooth_l1_loss(pred['velocity'], gt['velocity_gt'])
 
-        # Angular velocity loss
-        omega_loss = F.mse_loss(pred['angular_velocity'], gt['angular_velocity_gt'])
+        # Angular velocity loss (robust + temporal)
+        omega_dict = self.omega_loss_fn(
+            pred['angular_velocity'], gt['angular_velocity_gt'],
+            prev_omega_pred=prev_omega_pred,
+            prev_omega_gt=prev_omega_gt,
+        )
+        omega_loss = omega_dict['loss']
 
         # Geometry regularization: direction should still be reasonable
         cos_sim = F.cosine_similarity(pred['translation_direction'], gt['translation_direction_gt'], dim=-1)
@@ -227,3 +258,8 @@ class JointLoss(nn.Module):
             'geometry_reg': geometry_reg,
             'scale_reg': scale_reg,
         }
+
+
+# Keep old names for backward compatibility in imports
+GeometryLoss = OmegaLoss
+DynamicsLoss = TranslationLoss

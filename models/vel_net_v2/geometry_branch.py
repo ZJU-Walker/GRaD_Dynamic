@@ -1,21 +1,20 @@
 """
-Geometry Branch: Estimate angular velocity + translation direction from RGB + optical flow + IMU.
+Geometry Branch (TranslationBranch): Estimate translation direction from RGB + optical flow + IMU.
 
-No Rot6D/orientation input — must work without GT pose at deployment.
-Uses optical flow (from RAFT-Small, encoded by FlowEncoder) for rich motion signal.
-Full IMU (accel + gyro) in body frame.
+Angular velocity prediction has been moved to RotationNet (flow-based).
+This branch now receives omega_pred from RotationNet as an input feature
+instead of predicting omega itself.
 
 Input (per timestep):
   - rgb_features: (B, 32)      # from CompactEncoder FC (RGB only)
   - flow_features: (B, 64)     # from FlowEncoder (dense optical flow)
   - imu_accel: (B, 3)          # body-frame accelerometer
-  - imu_gyro: (B, 3)           # body-frame gyroscope (angular velocity)
+  - omega_pred: (B, 3)         # predicted omega from RotationNet
   - prev_vel: (B, 3)           # auto-regressive velocity estimate
 
-Per-step obs: [rgb_feat(32) + flow_feat(64) + accel(3) + gyro(3) + prev_vel(3)] = 105 dims
+Per-step obs: [rgb_feat(32) + flow_feat(64) + accel(3) + omega_pred(3) + prev_vel(3)] = 105 dims
 
 Output:
-  - angular_velocity: (B, 3)   # body frame omega
   - translation_direction: (B, 3) unit vector
   - confidence: (B, 1)
 """
@@ -23,18 +22,17 @@ Output:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Dict
+from typing import Dict
 
 
 class GeometryBranch(nn.Module):
     """
-    Estimate angular velocity and translation direction from visual + IMU inputs.
+    Estimate translation direction from visual + IMU + predicted omega inputs.
 
     Architecture:
       - InputNorm: LayerNorm(105)
       - Projector MLP: 105 → 128 → 128
       - GRU: 2 layers, hidden_dim=128
-      - Angular velocity head: MLP 128→64→3
       - Translation direction head: MLP 128→64→3 + L2 normalize
       - Confidence head: MLP 128→32→1 + sigmoid
 
@@ -45,7 +43,7 @@ class GeometryBranch(nn.Module):
         gru_layers: Number of GRU layers (default: 2)
     """
 
-    OBS_DIM = 105  # rgb(32) + flow(64) + accel(3) + gyro(3) + prev_vel(3)
+    OBS_DIM = 105  # rgb(32) + flow(64) + accel(3) + omega_pred(3) + prev_vel(3)
 
     def __init__(
         self,
@@ -81,13 +79,6 @@ class GeometryBranch(nn.Module):
             batch_first=True,
         )
 
-        # Angular velocity head
-        self.omega_head = nn.Sequential(
-            nn.Linear(hidden_dim, 64),
-            nn.ELU(),
-            nn.Linear(64, 3),
-        )
-
         # Translation direction head (output normalized to unit vector)
         self.direction_head = nn.Sequential(
             nn.Linear(hidden_dim, 64),
@@ -115,7 +106,7 @@ class GeometryBranch(nn.Module):
         rgb_feat: torch.Tensor,
         flow_feat: torch.Tensor,
         imu_accel: torch.Tensor,
-        imu_gyro: torch.Tensor,
+        omega_pred: torch.Tensor,
         prev_vel: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """
@@ -125,12 +116,11 @@ class GeometryBranch(nn.Module):
             rgb_feat: (B, 32) RGB features from CompactEncoder
             flow_feat: (B, 64) flow features from FlowEncoder
             imu_accel: (B, 3) body-frame accelerometer
-            imu_gyro: (B, 3) body-frame gyroscope
+            omega_pred: (B, 3) predicted angular velocity from RotationNet
             prev_vel: (B, 3) previous velocity estimate
 
         Returns:
             Dict with:
-              - angular_velocity: (B, 3)
               - translation_direction: (B, 3) unit vector
               - confidence: (B, 1)
         """
@@ -142,8 +132,8 @@ class GeometryBranch(nn.Module):
         if self._hidden_state.size(1) != B:
             self.reset_hidden_state(B)
 
-        # Concatenate inputs
-        obs = torch.cat([rgb_feat, flow_feat, imu_accel, imu_gyro, prev_vel], dim=1)  # (B, 105)
+        # Concatenate inputs (omega_pred replaces imu_gyro)
+        obs = torch.cat([rgb_feat, flow_feat, imu_accel, omega_pred, prev_vel], dim=1)  # (B, 105)
 
         # Normalize + project
         obs_norm = self.input_norm(obs)
@@ -154,15 +144,12 @@ class GeometryBranch(nn.Module):
         h = self._hidden_state[-1]  # (B, hidden_dim)
 
         # Heads
-        angular_velocity = self.omega_head(h)  # (B, 3)
-
         direction_raw = self.direction_head(h)  # (B, 3)
         direction_norm = F.normalize(direction_raw, p=2, dim=-1)  # unit vector
 
         confidence = self.confidence_head(h)  # (B, 1)
 
         return {
-            'angular_velocity': angular_velocity,
             'translation_direction': direction_norm,
             'confidence': confidence,
         }
